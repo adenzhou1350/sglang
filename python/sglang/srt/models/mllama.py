@@ -1004,7 +1004,7 @@ class MllamaForConditionalGeneration(nn.Module):
             # NOTE: we do not need image_inputs when prefill
             assert len(forward_batch.encoder_lens) == len(forward_batch.seq_lens)
             assert len(forward_batch.encoder_lens_cpu) == len(forward_batch.seq_lens)
-            skip_cross_attention = forward_batch.encoder_lens.max() == 0
+            skip_cross_attention = not forward_batch.has_encoder_tokens()
 
         if not skip_cross_attention:
             full_text_row_masked_out_mask = self.get_full_text_row_masked_out_mask(

@@ -1377,7 +1377,7 @@ class MossVLForConditionalGeneration(nn.Module):
         forward_batch.cross_attention_custom_mask = None
         if forward_batch.forward_mode.is_decode():
             return
-        if forward_batch.encoder_lens is None or forward_batch.encoder_lens.max() == 0:
+        if not forward_batch.has_encoder_tokens():
             return
 
         custom_mask = self._build_cross_attention_custom_mask(forward_batch)
@@ -1614,7 +1614,7 @@ class MossVLForConditionalGeneration(nn.Module):
             skip_cross_attention = False
         else:
             assert len(forward_batch.encoder_lens) == len(forward_batch.seq_lens)
-            skip_cross_attention = forward_batch.encoder_lens.max() == 0
+            skip_cross_attention = not forward_batch.has_encoder_tokens()
 
         # 2. Build full_text_row_masked_out_mask
         if not skip_cross_attention:

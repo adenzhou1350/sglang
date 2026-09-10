@@ -1110,6 +1110,17 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         return merged
 
+    def has_encoder_tokens(self) -> bool:
+        """Return whether this encoder-decoder batch has encoder tokens.
+
+        Use the host mirror for Python control flow. Reducing ``encoder_lens``
+        here would synchronize the model device in eager execution.
+        """
+        if self.encoder_lens is None:
+            return False
+        assert self.encoder_lens_cpu is not None
+        return any(self.encoder_lens_cpu)
+
     def contains_image_inputs(self) -> bool:
         if self.mm_inputs is None:
             return False
