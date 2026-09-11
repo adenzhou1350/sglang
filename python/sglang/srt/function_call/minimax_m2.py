@@ -27,6 +27,15 @@ class MinimaxM2Detector(BaseFormatDetector):
         </minimax:tool_call>
     """
 
+    _INCREMENTAL_PARAMETER_THRESHOLD = 256
+    _STREAMING_PARAMETER_REGEX = re.compile(
+        r"<parameter name=\"([^>]+)\">(.*?)</parameter>", re.DOTALL
+    )
+    tool_call_parameter_prefix = '<parameter name="'
+    tool_call_parameter_end_token = "</parameter>"
+    _pending_parameter_name: str | None
+    _pending_parameter_value_parts: List[str]
+
     def __init__(self):
         super().__init__()
         self.tool_call_start_token: str = "<minimax:tool_call>"
@@ -227,6 +236,11 @@ class MinimaxM2Detector(BaseFormatDetector):
     def parse_streaming_increment(
         self, new_text: str, tools: List[Tool]
     ) -> StreamingParseResult:
+        # Most assistant chunks contain no XML at all.  When there is no
+        # retained prefix, a chunk without '<' cannot begin any MiniMax marker.
+        if not self._in_tool_call and not self._buf and "<" not in new_text:
+            return StreamingParseResult(normal_text=new_text)
+
         self._buf += new_text
         normal = ""
         calls: List[ToolCallItem] = []
@@ -258,6 +272,7 @@ class MinimaxM2Detector(BaseFormatDetector):
                 self._current_function_name = ""
                 self._current_parameters = {}
                 self._streamed_parameters = {}
+                self._reset_parameter_state()
 
                 # Remove the start token
                 self._buf = self._buf[len(self.tool_call_start_token) :]
@@ -359,13 +374,12 @@ class MinimaxM2Detector(BaseFormatDetector):
         self, text_to_parse: str, tools: List[Tool]
     ) -> List[ToolCallItem]:
         """
-        Parse complete parameter blocks from text and return any tool call items to emit.
+        Incrementally parse parameter blocks and return tool call items to emit.
 
-        This method:
-        1. Finds all complete <parameter> blocks
-        2. Parses them into a dictionary
-        3. Compares with current parameters and generates diff if needed
-        4. Updates internal state
+        Accepted input is removed from ``self._buf`` exactly once.  While a
+        parameter value is incomplete, only suffixes that could finish a
+        delimiter remain in the grammar buffer; the value itself is collected
+        in parts and converted once when ``</parameter>`` arrives.
 
         Args:
             text_to_parse: The text to search for parameter blocks
@@ -374,38 +388,147 @@ class MinimaxM2Detector(BaseFormatDetector):
             List of ToolCallItem objects to emit (may be empty)
         """
         calls: List[ToolCallItem] = []
+        new_params: Dict[str, Any] = {}
 
-        # Find all complete parameter patterns
-        param_matches = list(
-            re.finditer(
-                r"<parameter name=\"([^>]+)\">(.*?)</parameter>",
-                text_to_parse,
-                re.DOTALL,
-            )
-        )
+        # CPython's regex engine is cheaper for short buffers.  Preserve that
+        # path exactly until enough accepted history exists for repeated scans
+        # and immutable-string appends to dominate.
+        if (
+            self._pending_parameter_name is None
+            and len(text_to_parse) < self._INCREMENTAL_PARAMETER_THRESHOLD
+        ):
+            for match in self._STREAMING_PARAMETER_REGEX.finditer(text_to_parse):
+                param_name = match.group(1).strip()
+                param_value = match.group(2)
+                new_params[param_name] = self._parse_parameter(
+                    self._current_function_name, param_name, param_value, tools
+                )
+            if not new_params:
+                return calls
+            return self._stream_parameter_updates(new_params)
 
-        # Build new parameters dictionary
-        new_params = {}
-        for match in param_matches:
-            param_name = match.group(1).strip()
-            param_value = match.group(2)
+        # ``text_to_parse`` snapshots ``self._buf`` at the call boundary.  Use
+        # the instance buffer below because it is compacted as transitions
+        # accept input.
+
+        while True:
+            if self._pending_parameter_name is None:
+                param_start = self._buf.find(self.tool_call_parameter_prefix)
+                function_end = self._buf.find(self.tool_call_function_end_token)
+
+                # Preserve the function terminator for the owning transition in
+                # parse_streaming_increment.
+                if function_end != -1 and (
+                    param_start == -1 or function_end < param_start
+                ):
+                    break
+
+                if param_start == -1:
+                    held = max(
+                        self._ends_with_partial_token(
+                            self._buf, self.tool_call_parameter_prefix
+                        ),
+                        self._ends_with_partial_token(
+                            self._buf, self.tool_call_function_end_token
+                        ),
+                    )
+                    self._buf = self._buf[-held:] if held else ""
+                    break
+
+                name_start = param_start + len(self.tool_call_parameter_prefix)
+                name_end = self._buf.find('">', name_start)
+                if name_end == -1:
+                    # Parameter names are schema-bounded.  Retain the incomplete
+                    # header, but discard any already ignored prefix.
+                    self._buf = self._buf[param_start:]
+                    break
+
+                self._pending_parameter_name = self._buf[name_start:name_end].strip()
+                self._pending_parameter_value_parts = []
+                self._buf = self._buf[name_end + 2 :]
+
+            param_end = self._buf.find(self.tool_call_parameter_end_token)
+            function_end = self._buf.find(self.tool_call_function_end_token)
+
+            # Match the old malformed-input behavior: an invoke terminator seen
+            # before a parameter terminator belongs to the outer transition.
+            if function_end != -1 and (param_end == -1 or function_end < param_end):
+                break
+
+            if param_end == -1:
+                held = max(
+                    self._ends_with_partial_token(
+                        self._buf, self.tool_call_parameter_end_token
+                    ),
+                    self._ends_with_partial_token(
+                        self._buf, self.tool_call_function_end_token
+                    ),
+                )
+                if held:
+                    accepted = self._buf[:-held]
+                    self._buf = self._buf[-held:]
+                else:
+                    accepted = self._buf
+                    self._buf = ""
+                if accepted:
+                    self._pending_parameter_value_parts.append(accepted)
+                break
+
+            self._pending_parameter_value_parts.append(self._buf[:param_end])
+            param_name = self._pending_parameter_name
+            assert param_name is not None
+            param_value = "".join(self._pending_parameter_value_parts)
+            self._buf = self._buf[param_end + len(self.tool_call_parameter_end_token) :]
+            self._reset_parameter_state()
+
             new_params[param_name] = self._parse_parameter(
                 self._current_function_name, param_name, param_value, tools
             )
 
-        # Calculate parameter diff to stream with proper incremental JSON building
-        if new_params != self._current_parameters:
-            previous_args_json = self.streamed_args_for_tool[self.current_tool_id]
+        return self._stream_parameter_updates(new_params)
 
-            # Build incremental JSON properly
-            if not self._current_parameters:
-                # First parameter(s) - start JSON object but don't close it yet
-                items = []
-                for key, value in new_params.items():
-                    items.append(
+    def _stream_parameter_updates(
+        self, new_params: Dict[str, Any]
+    ) -> List[ToolCallItem]:
+        """Serialize newly completed parameters using the legacy wire format."""
+        calls: List[ToolCallItem] = []
+        if not new_params:
+            return calls
+
+        previous_args_json = self.streamed_args_for_tool[self.current_tool_id]
+
+        # Build incremental JSON properly
+        if not self._current_parameters:
+            # First parameter(s) - start JSON object but don't close it yet
+            items = []
+            for key, value in new_params.items():
+                items.append(
+                    f"{json.dumps(key, ensure_ascii=False)}: {json.dumps(value, ensure_ascii=False)}"
+                )
+            json_fragment = "{" + ", ".join(items)
+
+            calls.append(
+                ToolCallItem(
+                    tool_index=self.current_tool_id,
+                    name=None,
+                    parameters=json_fragment,
+                )
+            )
+            self.streamed_args_for_tool[self.current_tool_id] = json_fragment
+
+        else:
+            # Additional parameters - add them incrementally
+            new_keys = set(new_params.keys()) - set(self._current_parameters.keys())
+            if new_keys:
+                # Build the continuation part (no closing brace yet)
+                continuation_parts = []
+                for key in new_keys:
+                    value = new_params[key]
+                    continuation_parts.append(
                         f"{json.dumps(key, ensure_ascii=False)}: {json.dumps(value, ensure_ascii=False)}"
                     )
-                json_fragment = "{" + ", ".join(items)
+
+                json_fragment = ", " + ", ".join(continuation_parts)
 
                 calls.append(
                     ToolCallItem(
@@ -414,38 +537,23 @@ class MinimaxM2Detector(BaseFormatDetector):
                         parameters=json_fragment,
                     )
                 )
-                self.streamed_args_for_tool[self.current_tool_id] = json_fragment
+                self.streamed_args_for_tool[self.current_tool_id] = (
+                    previous_args_json + json_fragment
+                )
 
-            else:
-                # Additional parameters - add them incrementally
-                new_keys = set(new_params.keys()) - set(self._current_parameters.keys())
-                if new_keys:
-                    # Build the continuation part (no closing brace yet)
-                    continuation_parts = []
-                    for key in new_keys:
-                        value = new_params[key]
-                        continuation_parts.append(
-                            f"{json.dumps(key, ensure_ascii=False)}: {json.dumps(value, ensure_ascii=False)}"
-                        )
-
-                    json_fragment = ", " + ", ".join(continuation_parts)
-
-                    calls.append(
-                        ToolCallItem(
-                            tool_index=self.current_tool_id,
-                            name=None,
-                            parameters=json_fragment,
-                        )
-                    )
-                    self.streamed_args_for_tool[self.current_tool_id] = (
-                        previous_args_json + json_fragment
-                    )
-
-            # Update current state
-            self._current_parameters = new_params
-            self.prev_tool_call_arr[self.current_tool_id]["arguments"] = new_params
+        # Update current state.  Only newly completed parameters are in
+        # new_params after the incremental transition; the guarded legacy path
+        # may include prior keys, for which update is idempotent.
+        self._current_parameters.update(new_params)
+        self.prev_tool_call_arr[self.current_tool_id]["arguments"] = dict(
+            self._current_parameters
+        )
 
         return calls
+
+    def _reset_parameter_state(self) -> None:
+        self._pending_parameter_name = None
+        self._pending_parameter_value_parts = []
 
     def _reset_streaming_state(self, still_in_tool_call: bool = False):
         """Reset streaming state for the next tool call"""
@@ -455,6 +563,7 @@ class MinimaxM2Detector(BaseFormatDetector):
         self._current_parameters = {}
         self._streamed_parameters = {}
         self.current_tool_name_sent = False
+        self._reset_parameter_state()
 
     def _extract(self, text: str, tools: List[Tool]) -> Tuple[str, List[ToolCallItem]]:
         normal_parts: List[str] = []
