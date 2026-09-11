@@ -1419,4 +1419,95 @@ mod tests {
         let mut empty = SamplingParamsInput::Many(Vec::new());
         empty.apply_preferred(&not_object).unwrap();
     }
+
+    #[test]
+    #[ignore]
+    fn bench_preferred_sampling_merge_production() {
+        use std::hint::black_box;
+        use std::time::{Duration, Instant};
+
+        let shape =
+            std::env::var("SG_PREFERRED_MERGE_SHAPE").unwrap_or_else(|_| "batch16".to_string());
+        let request_count: usize = std::env::var("SG_PREFERRED_MERGE_INPUTS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(2_000);
+        let preferred = serde_json::json!({
+            "max_new_tokens": 1024,
+            "stop": ["<stop>", "<end>"],
+            "temperature": 0.2,
+            "top_p": 0.9,
+            "top_k": 64,
+            "min_p": 0.05,
+            "frequency_penalty": 0.1,
+            "ignore_eos": true,
+            "json_schema": "{\"type\":\"object\"}",
+            "logit_bias": {"7": 1.5, "11": -0.5},
+            "custom_params": {"backend": "preferred", "enabled": true}
+        });
+        let request_value = match shape.as_str() {
+            "scalar_sparse" => serde_json::json!({"temperature": 1.0}),
+            "scalar_heap" => serde_json::json!({
+                "stop": ["request-stop"],
+                "json_schema": "{\"type\":\"string\"}",
+                "custom_params": {"backend": "request"}
+            }),
+            "batch16" | "batch128" => {
+                let width = if shape == "batch16" { 16 } else { 128 };
+                serde_json::Value::Array(
+                    (0..width)
+                        .map(|index| match index % 4 {
+                            0 => serde_json::json!({"temperature": 1.0}),
+                            1 => serde_json::json!({"top_p": null, "stop": ["request"]}),
+                            2 => serde_json::json!({"top_k": 8, "logit_bias": {"3": 0.5}}),
+                            _ => serde_json::json!({"custom_params": {"index": index as u64}}),
+                        })
+                        .collect(),
+                )
+            }
+            other => panic!("unknown SG_PREFERRED_MERGE_SHAPE={other}"),
+        };
+        let template: SamplingParamsInput = serde_json::from_value(request_value).unwrap();
+        let batch_width = match &template {
+            SamplingParamsInput::One(_) => 1,
+            SamplingParamsInput::Many(params) => params.len(),
+        };
+        let chunk_size = if batch_width >= 128 { 8 } else { 64 };
+        let mut elapsed = Duration::ZERO;
+        let mut remaining = request_count;
+        let mut output_bytes = 0usize;
+        let mut output_hash = 0xcbf29ce484222325u64;
+
+        while remaining != 0 {
+            let count = remaining.min(chunk_size);
+            let mut inputs = vec![template.clone(); count];
+            let started = Instant::now();
+            for input in &mut inputs {
+                black_box(input)
+                    .apply_preferred(black_box(&preferred))
+                    .unwrap();
+            }
+            elapsed += started.elapsed();
+            for input in &inputs {
+                let bytes = match input {
+                    SamplingParamsInput::One(params) => serde_json::to_vec(&**params).unwrap(),
+                    SamplingParamsInput::Many(params) => serde_json::to_vec(params).unwrap(),
+                };
+                output_bytes += bytes.len();
+                for byte in bytes {
+                    output_hash ^= u64::from(byte);
+                    output_hash = output_hash.wrapping_mul(0x100000001b3);
+                }
+                output_hash ^= 0xff;
+                output_hash = output_hash.wrapping_mul(0x100000001b3);
+            }
+            remaining -= count;
+        }
+
+        println!(
+            "PREFERRED_MERGE_BENCH shape={shape} requests={request_count} sampling_objects={} ns={} output_bytes={output_bytes} output_hash={output_hash:016x}",
+            request_count * batch_width,
+            elapsed.as_nanos()
+        );
+    }
 }
