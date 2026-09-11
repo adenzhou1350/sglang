@@ -308,12 +308,26 @@ impl SamplingParamsInput {
     /// Merge launch-time preferred params beneath request params. A request key
     /// wins even when it explicitly carries the type's default or null.
     pub fn apply_preferred(&mut self, preferred: &serde_json::Value) -> Result<(), String> {
+        // `ServerArgs::validate` has already checked this object before the API
+        // starts. Parse it once here rather than rebuilding and deserializing a
+        // merged JSON object for every sampling object in a batched request.
+        // Keep the empty-list behavior of the previous `try_for_each`: with no
+        // request object to merge, it did not inspect `preferred` at all.
+        if matches!(self, Self::Many(params) if params.is_empty()) {
+            return Ok(());
+        }
+        let object = preferred
+            .as_object()
+            .ok_or_else(|| "preferred_sampling_params must be a JSON object".to_string())?;
+        let preferred = sampling_params_from_value(serde_json::Value::Object(object.clone()))?;
+
         match self {
-            Self::One(params) => apply_preferred_to_one(params, preferred),
+            Self::One(params) => apply_preferred_to_one(params, &preferred),
             Self::Many(params) => params
                 .iter_mut()
-                .try_for_each(|params| apply_preferred_to_one(params, preferred)),
+                .for_each(|params| apply_preferred_to_one(params, &preferred)),
         }
+        Ok(())
     }
 
     pub fn from_preferred(preferred: &serde_json::Value) -> Result<Self, String> {
@@ -321,25 +335,64 @@ impl SamplingParamsInput {
     }
 }
 
-fn apply_preferred_to_one(
-    params: &mut SamplingParams,
-    preferred: &serde_json::Value,
-) -> Result<(), String> {
-    let mut merged = preferred
-        .as_object()
-        .ok_or_else(|| "preferred_sampling_params must be a JSON object".to_string())?
-        .clone();
-    let request_value = serde_json::to_value(&*params).map_err(|e| e.to_string())?;
-    let request = request_value
-        .as_object()
-        .ok_or_else(|| "SamplingParams did not serialize as an object".to_string())?;
-    for field in &params.explicit_fields {
-        if let Some(value) = request.get(field) {
-            merged.insert(field.clone(), value.clone());
-        }
+fn apply_preferred_to_one(params: &mut SamplingParams, preferred: &SamplingParams) {
+    macro_rules! inherit_omitted {
+        ($($field:ident),+ $(,)?) => {{
+            // No `..`: adding a struct field fails compilation until it is
+            // classified as client-facing above or internal below.
+            let SamplingParams {
+                $($field: _,)+
+                stop_strs: _,
+                stop_regex_strs: _,
+                stop_str_max_len: _,
+                stop_regex_max_len: _,
+                is_normalized: _,
+                explicit_fields: _,
+            } = preferred;
+            $(
+                if preferred.explicit_fields.contains(stringify!($field))
+                    && !params.explicit_fields.contains(stringify!($field))
+                {
+                    params.$field.clone_from(&preferred.$field);
+                }
+            )+
+        }};
     }
-    *params = sampling_params_from_value(serde_json::Value::Object(merged))?;
-    Ok(())
+
+    // List every client-facing field explicitly. A new `SamplingParams` field
+    // therefore requires a deliberate merge decision next to the struct's own
+    // completeness-checked `Default` implementation and the equivalence test.
+    inherit_omitted!(
+        max_new_tokens,
+        stop,
+        stop_token_ids,
+        stop_regex,
+        temperature,
+        top_p,
+        top_k,
+        min_p,
+        frequency_penalty,
+        presence_penalty,
+        repetition_penalty,
+        min_new_tokens,
+        n,
+        beam_width,
+        json_schema,
+        regex,
+        ebnf,
+        structural_tag,
+        ignore_eos,
+        skip_special_tokens,
+        spaces_between_special_tokens,
+        no_stop_trim,
+        stream_interval,
+        logit_bias,
+        sampling_seed,
+        custom_params,
+    );
+    params
+        .explicit_fields
+        .extend(preferred.explicit_fields.iter().cloned());
 }
 
 impl Default for SamplingParams {
@@ -1235,5 +1288,135 @@ mod tests {
         };
         assert_eq!((params[0].temperature, params[0].top_p), (0.5, 0.75));
         assert_eq!((params[1].temperature, params[1].top_p), (0.25, 0.9));
+    }
+
+    fn apply_preferred_json_oracle(
+        params: &mut SamplingParams,
+        preferred: &serde_json::Value,
+    ) -> Result<(), String> {
+        let mut merged = preferred
+            .as_object()
+            .ok_or_else(|| "preferred_sampling_params must be a JSON object".to_string())?
+            .clone();
+        let request_value = serde_json::to_value(&*params).map_err(|e| e.to_string())?;
+        let request = request_value
+            .as_object()
+            .ok_or_else(|| "SamplingParams did not serialize as an object".to_string())?;
+        for field in &params.explicit_fields {
+            if let Some(value) = request.get(field) {
+                merged.insert(field.clone(), value.clone());
+            }
+        }
+        *params = sampling_params_from_value(serde_json::Value::Object(merged))?;
+        Ok(())
+    }
+
+    #[test]
+    fn direct_preferred_merge_matches_json_oracle_for_every_input_field() {
+        let preferred = serde_json::json!({
+            "max_new_tokens": 33,
+            "stop": ["preferred-stop"],
+            "stop_token_ids": [7, 8],
+            "stop_regex": "preferred.*",
+            "temperature": 0.25,
+            "top_p": 0.75,
+            "top_k": 32,
+            "min_p": 0.1,
+            "frequency_penalty": 0.2,
+            "presence_penalty": 0.3,
+            "repetition_penalty": 1.1,
+            "min_new_tokens": 2,
+            "n": 3,
+            "beam_width": 4,
+            "json_schema": "{\"type\":\"string\"}",
+            "regex": "preferred-regex",
+            "ebnf": "root ::= 'p'",
+            "structural_tag": "preferred-tag",
+            "ignore_eos": true,
+            "skip_special_tokens": false,
+            "spaces_between_special_tokens": false,
+            "no_stop_trim": true,
+            "stream_interval": 5,
+            "logit_bias": {"7": 1.5},
+            "sampling_seed": 42,
+            "custom_params": {"mode": "preferred", "enabled": true}
+        });
+        // Override alternating scalar and heap-backed fields. Explicit nulls are
+        // intentional: serde maps some of them back to the type default, but the
+        // preferred value must still not replace that explicit request choice.
+        let request = serde_json::json!({
+            "max_new_tokens": null,
+            "stop_token_ids": [99],
+            "temperature": null,
+            "top_k": 8,
+            "frequency_penalty": 0.9,
+            "repetition_penalty": 1.3,
+            "n": 1,
+            "json_schema": "{\"type\":\"number\"}",
+            "ebnf": "root ::= 'r'",
+            "ignore_eos": false,
+            "spaces_between_special_tokens": true,
+            "stream_interval": 9,
+            "sampling_seed": 7
+        });
+        let request = request.to_string();
+        let original: SamplingParams = serde_json::from_str(&request).unwrap();
+        let mut oracle = original.clone();
+        apply_preferred_json_oracle(&mut oracle, &preferred).unwrap();
+
+        let mut direct = SamplingParamsInput::One(Box::new(original));
+        direct.apply_preferred(&preferred).unwrap();
+        let SamplingParamsInput::One(direct) = direct else {
+            unreachable!()
+        };
+        assert_eq!(*direct, oracle);
+        assert_eq!(
+            serde_json::to_value(&*direct).unwrap(),
+            serde_json::to_value(&oracle).unwrap()
+        );
+    }
+
+    #[test]
+    fn direct_preferred_merge_matches_json_oracle_for_batches_and_errors() {
+        let preferred = serde_json::json!({
+            "temperature": 0.25,
+            "stop": ["preferred"],
+            "custom_params": {"source": "launch"}
+        });
+        let mut direct: SamplingParamsInput = serde_json::from_str(
+            r#"[{"temperature":1.0},{"stop":null},{"custom_params":{"source":"request"}}]"#,
+        )
+        .unwrap();
+        let mut expected = match direct.clone() {
+            SamplingParamsInput::Many(params) => params,
+            SamplingParamsInput::One(_) => unreachable!(),
+        };
+        for params in &mut expected {
+            apply_preferred_json_oracle(params, &preferred).unwrap();
+        }
+        direct.apply_preferred(&preferred).unwrap();
+        let SamplingParamsInput::Many(actual) = direct else {
+            unreachable!()
+        };
+        assert_eq!(actual, expected);
+
+        let mut scalar: SamplingParamsInput = serde_json::from_str("{}").unwrap();
+        let not_object = serde_json::json!([1, 2]);
+        assert_eq!(
+            scalar.apply_preferred(&not_object).unwrap_err(),
+            "preferred_sampling_params must be a JSON object"
+        );
+        let unknown = serde_json::json!({"not_a_sampling_field": 1});
+        assert!(
+            scalar
+                .apply_preferred(&unknown)
+                .unwrap_err()
+                .contains("unknown field")
+        );
+
+        // Preserve the old `try_for_each` behavior: an empty request list does
+        // not inspect a preferred value because there is no object to merge.
+        let mut empty = SamplingParamsInput::Many(Vec::new());
+        empty.apply_preferred(&not_object).unwrap();
     }
 }
