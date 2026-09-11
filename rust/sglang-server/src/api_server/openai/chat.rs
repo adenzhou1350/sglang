@@ -18,12 +18,14 @@ use dynamo_parsers::tool_calling::jail::{Annotated, apply_tool_calling_jail};
 use dynamo_parsers::{ToolChoice as DynamoToolChoice, ToolDefinition};
 use dynamo_protocols::types::{
     ChatChoice, ChatChoiceLogprobs, ChatChoiceStream, ChatCompletionMessageContent,
-    ChatCompletionResponseMessage, ChatCompletionTokenLogprob, ChatCompletionToolChoiceOption,
-    CreateChatCompletionRequest, CreateChatCompletionResponse, CreateChatCompletionStreamResponse,
-    FinishReason as OpenAIFinishReason, ResponseFormat, Role, ServiceTier as ChatServiceTier, Stop,
-    TopLogprobs,
+    ChatCompletionResponseMessage, ChatCompletionStreamResponseDelta, ChatCompletionTokenLogprob,
+    ChatCompletionToolChoiceOption, CreateChatCompletionRequest, CreateChatCompletionResponse,
+    CreateChatCompletionStreamResponse, FinishReason as OpenAIFinishReason, ResponseFormat, Role,
+    ServiceTier as ChatServiceTier, Stop, TopLogprobs,
 };
 use futures::StreamExt;
+use serde::ser::{SerializeMap, SerializeSeq};
+use serde::{Serialize, Serializer};
 use tokio::sync::mpsc;
 
 use super::super::guard::AbortGuard;
@@ -753,7 +755,7 @@ pub(super) fn chat_event_stream(
         let mut tool_calls_seen = vec![false; count];
         futures::pin_mut!(parsed);
         while let Some(mut item) = parsed.next().await {
-            if let Some(response) = item.data.as_mut() {
+            if let Some(mut response) = item.data.take() {
                 if !parallel_tool_calls {
                     for choice in &mut response.choices {
                         let index = choice.index as usize;
@@ -774,7 +776,7 @@ pub(super) fn chat_event_stream(
                         }
                     }
                 }
-                yield serialize_chat_stream_response(response.clone());
+                yield serialize_chat_stream_response(&response);
             } else if let Some(error) = item.error {
                 yield error;
             }
@@ -783,17 +785,138 @@ pub(super) fn chat_event_stream(
     }
 }
 
-fn serialize_chat_stream_response(response: CreateChatCompletionStreamResponse) -> String {
-    let mut response = serde_json::to_value(response).expect("OpenAI response must serialize");
-    if let Some(delta) = response
-        .pointer_mut("/choices/0/delta")
-        .and_then(serde_json::Value::as_object_mut)
+/// Borrowed wire view that preserves the existing `serde_json::Value` key order
+/// while avoiding a cloned response and a recursive intermediate value tree.
+struct ChatStreamWire<'a>(&'a CreateChatCompletionStreamResponse);
+
+struct ChatChoicesWire<'a>(&'a [ChatChoiceStream]);
+
+struct ChatChoiceWire<'a> {
+    choice: &'a ChatChoiceStream,
+    force_reasoning: bool,
+}
+
+struct ChatDeltaWire<'a> {
+    delta: &'a ChatCompletionStreamResponseDelta,
+    force_reasoning: bool,
+}
+
+impl Serialize for ChatStreamWire<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
     {
-        delta
-            .entry("reasoning_content")
-            .or_insert(serde_json::Value::Null);
+        let CreateChatCompletionStreamResponse {
+            id,
+            choices,
+            created,
+            model,
+            service_tier,
+            system_fingerprint,
+            object,
+            usage,
+        } = self.0;
+        let mut map = serializer.serialize_map(Some(8))?;
+        map.serialize_entry("id", id)?;
+        map.serialize_entry("choices", &ChatChoicesWire(choices))?;
+        map.serialize_entry("created", created)?;
+        map.serialize_entry("model", model)?;
+        map.serialize_entry("service_tier", service_tier)?;
+        map.serialize_entry("system_fingerprint", system_fingerprint)?;
+        map.serialize_entry("object", object)?;
+        map.serialize_entry("usage", usage)?;
+        map.end()
     }
-    response.to_string()
+}
+
+impl Serialize for ChatChoicesWire<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut seq = serializer.serialize_seq(Some(self.0.len()))?;
+        for (index, choice) in self.0.iter().enumerate() {
+            seq.serialize_element(&ChatChoiceWire {
+                choice,
+                // The old JSON-pointer mutation only touched choices[0].
+                force_reasoning: index == 0,
+            })?;
+        }
+        seq.end()
+    }
+}
+
+impl Serialize for ChatChoiceWire<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let ChatChoiceStream {
+            index,
+            delta,
+            finish_reason,
+            logprobs,
+        } = self.choice;
+        let mut map = serializer.serialize_map(Some(4))?;
+        map.serialize_entry("index", index)?;
+        map.serialize_entry(
+            "delta",
+            &ChatDeltaWire {
+                delta,
+                force_reasoning: self.force_reasoning,
+            },
+        )?;
+        map.serialize_entry("finish_reason", finish_reason)?;
+        map.serialize_entry("logprobs", logprobs)?;
+        map.end()
+    }
+}
+
+impl Serialize for ChatDeltaWire<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let ChatCompletionStreamResponseDelta {
+            content,
+            function_call,
+            tool_calls,
+            role,
+            refusal,
+            reasoning_content,
+        } = self.delta;
+        let mut len = usize::from(self.force_reasoning || reasoning_content.is_some());
+        len += usize::from(content.is_some());
+        len += usize::from(function_call.is_some());
+        len += usize::from(refusal.is_some());
+        len += usize::from(role.is_some());
+        len += usize::from(tool_calls.is_some());
+
+        let mut map = serializer.serialize_map(Some(len))?;
+        if let Some(content) = content {
+            map.serialize_entry("content", content)?;
+        }
+        if let Some(function_call) = function_call {
+            map.serialize_entry("function_call", function_call)?;
+        }
+        if let Some(tool_calls) = tool_calls {
+            map.serialize_entry("tool_calls", tool_calls)?;
+        }
+        if let Some(role) = role {
+            map.serialize_entry("role", role)?;
+        }
+        if let Some(refusal) = refusal {
+            map.serialize_entry("refusal", refusal)?;
+        }
+        if self.force_reasoning || reasoning_content.is_some() {
+            map.serialize_entry("reasoning_content", reasoning_content)?;
+        }
+        map.end()
+    }
+}
+
+fn serialize_chat_stream_response(response: &CreateChatCompletionStreamResponse) -> String {
+    serde_json::to_string(&ChatStreamWire(response)).expect("OpenAI response must serialize")
 }
 
 #[allow(deprecated)]
@@ -852,14 +975,17 @@ pub(super) fn chat_logprobs(extras: Option<&ChunkExtras>) -> ChatChoiceLogprobs 
 mod tests {
     use super::super::test_utils::{chat_submitted, chunk, senders};
     use super::{
-        SamplingDefaults, chat_event_stream, chat_logprobs, chat_sampling_params,
-        merge_template_stops, unary_chat,
+        SamplingDefaults, chat_delta, chat_event_stream, chat_logprobs, chat_sampling_params,
+        completion_usage, merge_template_stops, serialize_chat_stream_response, unary_chat,
     };
     use crate::api_server::guard::AbortGuard;
     use crate::message::config::DefaultSamplingParams;
     use crate::message::response::ChunkExtras;
     use axum::http::StatusCode;
-    use dynamo_protocols::types::{CreateChatCompletionRequest, Stop};
+    use dynamo_protocols::types::{
+        ChatChoiceStream, CreateChatCompletionRequest, CreateChatCompletionStreamResponse, Role,
+        Stop,
+    };
     use futures::StreamExt;
 
     fn request() -> CreateChatCompletionRequest {
@@ -868,6 +994,81 @@ mod tests {
             "messages": [{"role": "user", "content": "hi"}]
         }))
         .unwrap()
+    }
+
+    fn value_based_chat_stream_serialization(
+        response: CreateChatCompletionStreamResponse,
+    ) -> String {
+        let mut response = serde_json::to_value(response).unwrap();
+        if let Some(delta) = response
+            .pointer_mut("/choices/0/delta")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            delta
+                .entry("reasoning_content")
+                .or_insert(serde_json::Value::Null);
+        }
+        response.to_string()
+    }
+
+    fn stream_response(choices: Vec<ChatChoiceStream>) -> CreateChatCompletionStreamResponse {
+        CreateChatCompletionStreamResponse {
+            id: "chatcmpl-byte-parity".into(),
+            choices,
+            created: 7,
+            model: "model/escaped\"\\\n".into(),
+            service_tier: None,
+            system_fingerprint: None,
+            object: "chat.completion.chunk".into(),
+            usage: Some(completion_usage(11, 13)),
+        }
+    }
+
+    #[test]
+    fn direct_chat_stream_serialization_matches_value_wire_bytes() {
+        let choices = [
+            Vec::new(),
+            vec![ChatChoiceStream {
+                index: 0,
+                delta: chat_delta(None, Some(Role::Assistant), None, None),
+                finish_reason: None,
+                logprobs: None,
+            }],
+            vec![ChatChoiceStream {
+                index: 0,
+                delta: chat_delta(Some("plain\"\\\ntext".into()), None, None, None),
+                finish_reason: None,
+                logprobs: None,
+            }],
+            vec![ChatChoiceStream {
+                index: 0,
+                delta: chat_delta(None, None, None, Some("reasoning".into())),
+                finish_reason: None,
+                logprobs: None,
+            }],
+            vec![
+                ChatChoiceStream {
+                    index: 0,
+                    delta: chat_delta(Some("first".into()), None, None, None),
+                    finish_reason: None,
+                    logprobs: None,
+                },
+                ChatChoiceStream {
+                    index: 1,
+                    delta: chat_delta(Some("second".into()), None, None, None),
+                    finish_reason: None,
+                    logprobs: None,
+                },
+            ],
+        ];
+
+        for choices in choices {
+            let response = stream_response(choices);
+            assert_eq!(
+                serialize_chat_stream_response(&response),
+                value_based_chat_stream_serialization(response)
+            );
+        }
     }
 
     /// Python `to_sampling_params` priority: user value > model generation
