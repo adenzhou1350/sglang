@@ -603,3 +603,105 @@ fn extract_assistant_text(
         }
     }
 }
+
+#[cfg(test)]
+mod performance_tests {
+    use super::*;
+
+    #[test]
+    #[ignore]
+    fn bench_legacy_template_render_production() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        let shape = std::env::var("SG_LEGACY_TEMPLATE_SHAPE")
+            .unwrap_or_else(|_| "chatml_32_medium".to_string());
+        let iterations: usize = std::env::var("SG_LEGACY_TEMPLATE_ITERATIONS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(5_000);
+        let (style, message_count, content_bytes): (&str, usize, usize) = match shape.as_str() {
+            "chatml_2_short" => ("CHATML", 2, 32),
+            "chatml_32_medium" => ("CHATML", 32, 256),
+            "llama3_32_medium" => ("LLAMA3", 32, 256),
+            "add_colon_two_128_medium" => ("ADD_COLON_TWO", 128, 256),
+            "chatml_8_long" => ("CHATML", 8, 4096),
+            other => panic!("unknown SG_LEGACY_TEMPLATE_SHAPE={other}"),
+        };
+        let (system_template, sep, sep2, roles) = match style {
+            "CHATML" => (
+                "<|im_start|>system\n{system_message}",
+                "<|im_end|>",
+                None,
+                ("<|im_start|>user", "<|im_start|>assistant"),
+            ),
+            "LLAMA3" => (
+                "<|start_header_id|>system<|end_header_id|>\n\n{system_message}<|eot_id|>",
+                "",
+                None,
+                ("user", "assistant"),
+            ),
+            "ADD_COLON_TWO" => (
+                "{system_message}",
+                "\n###",
+                Some("\n</s>"),
+                ("USER", "ASSISTANT"),
+            ),
+            _ => unreachable!(),
+        };
+        let formatter = LegacyFormatter {
+            spec: LegacySpec {
+                system_template: system_template.into(),
+                system_message: "You are a helpful assistant.".into(),
+                roles: (roles.0.into(), roles.1.into()),
+                style: style.into(),
+                sep: sep.into(),
+                sep2: sep2.map(str::to_owned),
+                ..Default::default()
+            },
+        };
+        let messages: Vec<_> = (0..message_count)
+            .map(|index| {
+                let role = if index.is_multiple_of(2) {
+                    formatter.spec.roles.0.clone()
+                } else {
+                    formatter.spec.roles.1.clone()
+                };
+                let prefix = format!("message-{index}-");
+                let content = prefix.clone() + &"x".repeat(content_bytes - prefix.len());
+                (role, content)
+            })
+            .chain(std::iter::once((
+                formatter.spec.roles.1.clone(),
+                String::new(),
+            )))
+            .collect();
+
+        let started = Instant::now();
+        let mut total_bytes = 0usize;
+        for _ in 0..iterations {
+            let output = black_box(&formatter)
+                .render_prompt(
+                    black_box(&formatter.spec.system_message),
+                    black_box(&messages),
+                )
+                .unwrap();
+            total_bytes = total_bytes.wrapping_add(black_box(output.len()));
+        }
+        let elapsed = started.elapsed();
+        let output = formatter
+            .render_prompt(&formatter.spec.system_message, &messages)
+            .unwrap();
+        let mut output_hash = 0xcbf29ce484222325u64;
+        for byte in output.as_bytes() {
+            output_hash ^= u64::from(*byte);
+            output_hash = output_hash.wrapping_mul(0x100000001b3);
+        }
+        println!(
+            "LEGACY_TEMPLATE_BENCH shape={shape} iterations={iterations} messages={} ns={} total_bytes={total_bytes} output_bytes={} output_hash={output_hash:016x}",
+            messages.len(),
+            elapsed.as_nanos(),
+            output.len()
+        );
+    }
+}
