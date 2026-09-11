@@ -849,6 +849,126 @@ pub(super) fn chat_logprobs(extras: Option<&ChunkExtras>) -> ChatChoiceLogprobs 
 }
 
 #[cfg(test)]
+fn production_contains_media_for_bench(
+    messages: &[dynamo_protocols::types::ChatCompletionRequestMessage],
+) -> bool {
+    serde_json::to_value(messages).is_ok_and(|value| contains_media(&value))
+}
+
+#[cfg(test)]
+mod performance_tests {
+    use super::production_contains_media_for_bench;
+    use dynamo_protocols::types::ChatCompletionRequestMessage;
+    use std::hint::black_box;
+    use std::time::Instant;
+
+    fn text_message(role: &str, text: String, input_text_bytes: &mut usize) -> serde_json::Value {
+        *input_text_bytes += text.len();
+        serde_json::json!({"role": role, "content": text})
+    }
+
+    fn fixture(shape: &str) -> (Vec<ChatCompletionRequestMessage>, usize) {
+        let mut input_text_bytes = 0usize;
+        let mut values = Vec::new();
+        match shape {
+            "short_text" => {
+                for index in 0..4 {
+                    values.push(text_message(
+                        if index % 2 == 0 { "user" } else { "assistant" },
+                        "short plain request text ".repeat(4),
+                        &mut input_text_bytes,
+                    ));
+                }
+            }
+            "long_text" => {
+                for index in 0..16 {
+                    values.push(text_message(
+                        if index % 2 == 0 { "user" } else { "assistant" },
+                        "representative long prompt content ".repeat(16),
+                        &mut input_text_bytes,
+                    ));
+                }
+            }
+            "escaped_unicode" => {
+                for index in 0..16 {
+                    values.push(text_message(
+                        if index % 2 == 0 { "user" } else { "assistant" },
+                        "quote\" slash\\ newline\n Unicode🙂中文 ".repeat(12),
+                        &mut input_text_bytes,
+                    ));
+                }
+            }
+            "many_messages" => {
+                for index in 0..128 {
+                    values.push(text_message(
+                        if index % 2 == 0 { "user" } else { "assistant" },
+                        "history turn payload ".repeat(6),
+                        &mut input_text_bytes,
+                    ));
+                }
+            }
+            "media_first" | "media_last" => {
+                let media = serde_json::json!({
+                    "role": "user",
+                    "content": [{
+                        "type": "image_url",
+                        "image_url": {"url": "https://example.com/image.png"}
+                    }]
+                });
+                if shape == "media_first" {
+                    values.push(media.clone());
+                }
+                for index in 0..64 {
+                    values.push(text_message(
+                        if index % 2 == 0 { "user" } else { "assistant" },
+                        "media boundary history ".repeat(6),
+                        &mut input_text_bytes,
+                    ));
+                }
+                if shape == "media_last" {
+                    values.push(media);
+                }
+            }
+            other => panic!("unknown SG_CHAT_MEDIA_SHAPE: {other}"),
+        }
+        let messages = serde_json::from_value(serde_json::Value::Array(values)).unwrap();
+        (messages, input_text_bytes)
+    }
+
+    #[test]
+    #[ignore = "manual paired performance harness"]
+    fn bench_chat_media_scan_production() {
+        let shape = std::env::var("SG_CHAT_MEDIA_SHAPE").expect("SG_CHAT_MEDIA_SHAPE");
+        let iterations: usize = std::env::var("SG_CHAT_MEDIA_ITERS")
+            .expect("SG_CHAT_MEDIA_ITERS")
+            .parse()
+            .expect("numeric SG_CHAT_MEDIA_ITERS");
+        let (messages, input_text_bytes) = fixture(&shape);
+
+        for _ in 0..32 {
+            black_box(production_contains_media_for_bench(black_box(
+                messages.as_slice(),
+            )));
+        }
+
+        let started = Instant::now();
+        let mut hits = 0usize;
+        for _ in 0..iterations {
+            hits += usize::from(production_contains_media_for_bench(black_box(
+                messages.as_slice(),
+            )));
+        }
+        let elapsed_ns = started.elapsed().as_nanos();
+        black_box(hits);
+
+        println!(
+            "CHAT_MEDIA_BENCH shape={shape} iters={iterations} ns={elapsed_ns} hits={hits} messages={} input_text_bytes={input_text_bytes}",
+            messages.len()
+        );
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::super::test_utils::{chat_submitted, chunk, senders};
     use super::{
