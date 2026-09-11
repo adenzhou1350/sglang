@@ -124,6 +124,8 @@ impl LegacyFormatter {
         system_message: &str,
         messages: &[(String, String)],
     ) -> Result<String, TemplateError> {
+        use std::fmt::Write;
+
         let spec = &self.spec;
         // Python: `self.system_template.format(system_message=self.system_message)`.
         let system_prompt = spec
@@ -139,9 +141,9 @@ impl LegacyFormatter {
                 ret.push_str(&spec.sep);
                 for (role, content) in messages {
                     if content.is_empty() {
-                        ret.push_str(&format!("{role}:"));
+                        let _ = write!(ret, "{role}:");
                     } else {
-                        ret.push_str(&format!("{role}: {content}{}", spec.sep));
+                        let _ = write!(ret, "{role}: {content}{}", spec.sep);
                     }
                 }
             }
@@ -151,9 +153,9 @@ impl LegacyFormatter {
                 ret.push_str(&spec.sep);
                 for (i, (role, content)) in messages.iter().enumerate() {
                     if content.is_empty() {
-                        ret.push_str(&format!("{role}:"));
+                        let _ = write!(ret, "{role}:");
                     } else {
-                        ret.push_str(&format!("{role}: {content}{}", sep_even_odd(spec, sep2, i)));
+                        let _ = write!(ret, "{role}: {content}{}", sep_even_odd(spec, sep2, i));
                     }
                 }
             }
@@ -162,9 +164,9 @@ impl LegacyFormatter {
                 ret.push_str(&spec.sep);
                 for (role, content) in messages {
                     if content.is_empty() {
-                        ret.push_str(&format!("{role}: "));
+                        let _ = write!(ret, "{role}: ");
                     } else {
-                        ret.push_str(&format!("{role}: {content}{}", spec.sep));
+                        let _ = write!(ret, "{role}: {content}{}", spec.sep);
                     }
                 }
             }
@@ -175,9 +177,9 @@ impl LegacyFormatter {
                 }
                 for (role, content) in messages {
                     if content.is_empty() {
-                        ret.push_str(&format!("{role}\n"));
+                        let _ = writeln!(ret, "{role}");
                     } else {
-                        ret.push_str(&format!("{role}\n{content}{}", spec.sep));
+                        let _ = write!(ret, "{role}\n{content}{}", spec.sep);
                     }
                 }
             }
@@ -188,9 +190,9 @@ impl LegacyFormatter {
                 }
                 for (role, content) in messages {
                     if content.is_empty() {
-                        ret.push_str(&format!("{role}\n"));
+                        let _ = writeln!(ret, "{role}");
                     } else {
-                        ret.push_str(&format!("{role}\n{content}{}", spec.sep));
+                        let _ = write!(ret, "{role}\n{content}{}", spec.sep);
                     }
                 }
                 match &spec.stop_str {
@@ -210,7 +212,7 @@ impl LegacyFormatter {
                     if content.is_empty() {
                         ret.push_str(role);
                     } else {
-                        ret.push_str(&format!("{role}{content}{}", spec.sep));
+                        let _ = write!(ret, "{role}{content}{}", spec.sep);
                     }
                 }
             }
@@ -221,7 +223,7 @@ impl LegacyFormatter {
                     if content.is_empty() {
                         ret.push_str(role);
                     } else {
-                        ret.push_str(&format!("{role}{content}{}", sep_even_odd(spec, sep2, i)));
+                        let _ = write!(ret, "{role}{content}{}", sep_even_odd(spec, sep2, i));
                     }
                 }
             }
@@ -229,12 +231,13 @@ impl LegacyFormatter {
                 ret.push_str(&system_prompt);
                 for (role, content) in messages {
                     if content.is_empty() {
-                        ret.push_str(&format!("{role}:"));
+                        let _ = write!(ret, "{role}:");
                     } else {
-                        ret.push_str(&format!(
+                        let _ = write!(
+                            ret,
                             "{role}: {}",
                             content.replace("\r\n", "\n").replace("\n\n", "\n")
-                        ));
+                        );
                         ret.push_str("\n\n");
                     }
                 }
@@ -245,12 +248,13 @@ impl LegacyFormatter {
                 }
                 for (role, content) in messages {
                     if content.is_empty() {
-                        ret.push_str(&format!("<|header_start|>{role}<|header_end|>\n\n"));
+                        let _ = write!(ret, "<|header_start|>{role}<|header_end|>\n\n");
                     } else {
-                        ret.push_str(&format!(
+                        let _ = write!(
+                            ret,
                             "<|header_start|>{role}<|header_end|>\n\n{}<|eot|>",
                             content.trim()
-                        ));
+                        );
                     }
                 }
             }
@@ -260,12 +264,13 @@ impl LegacyFormatter {
                 }
                 for (role, content) in messages {
                     if content.is_empty() {
-                        ret.push_str(&format!("<|start_header_id|>{role}<|end_header_id|>\n\n"));
+                        let _ = write!(ret, "<|start_header_id|>{role}<|end_header_id|>\n\n");
                     } else {
-                        ret.push_str(&format!(
+                        let _ = write!(
+                            ret,
                             "<|start_header_id|>{role}<|end_header_id|>\n\n{}<|eot_id|>",
                             content.trim()
-                        ));
+                        );
                     }
                 }
             }
@@ -287,9 +292,9 @@ impl LegacyFormatter {
                     if content.is_empty() {
                         ret.push_str(tag);
                     } else if i == 0 {
-                        ret.push_str(&format!("{content} "));
+                        let _ = write!(ret, "{content} ");
                     } else {
-                        ret.push_str(&format!("{tag} {content}{}", sep_even_odd(spec, sep2, i)));
+                        let _ = write!(ret, "{tag} {content}{}", sep_even_odd(spec, sep2, i));
                     }
                 }
             }
@@ -302,12 +307,12 @@ impl LegacyFormatter {
                 }
                 for (i, (role, content)) in messages.iter().enumerate() {
                     if i % 2 == 0 {
-                        ret.push_str(&format!("[Round {}]{}", i / 2 + round_add_n, spec.sep));
+                        let _ = write!(ret, "[Round {}]{}", i / 2 + round_add_n, spec.sep);
                     }
                     if content.is_empty() {
-                        ret.push_str(&format!("{role}："));
+                        let _ = write!(ret, "{role}：");
                     } else {
-                        ret.push_str(&format!("{role}：{content}{}", spec.sep));
+                        let _ = write!(ret, "{role}：{content}{}", spec.sep);
                     }
                 }
             }
@@ -319,9 +324,9 @@ impl LegacyFormatter {
                 }
                 for (role, content) in messages {
                     if content.is_empty() {
-                        ret.push_str(&format!("{role}\n"));
+                        let _ = writeln!(ret, "{role}");
                     } else {
-                        ret.push_str(&format!("{role}\n{content}{}\n", spec.sep));
+                        let _ = write!(ret, "{role}\n{content}{}\n", spec.sep);
                     }
                 }
             }
@@ -333,7 +338,7 @@ impl LegacyFormatter {
                     if content.is_empty() {
                         ret.push_str(role);
                     } else {
-                        ret.push_str(&format!("{role}\n{content}"));
+                        let _ = write!(ret, "{role}\n{content}");
                     }
                 }
             }
@@ -345,12 +350,9 @@ impl LegacyFormatter {
                         ret.push_str("<s>");
                     }
                     if content.is_empty() {
-                        ret.push_str(&format!("{role}:"));
+                        let _ = write!(ret, "{role}:");
                     } else {
-                        ret.push_str(&format!(
-                            "{role}:{content}{}\n",
-                            sep_even_odd(spec, sep2, i)
-                        ));
+                        let _ = writeln!(ret, "{role}:{content}{}", sep_even_odd(spec, sep2, i));
                     }
                 }
             }
@@ -359,12 +361,9 @@ impl LegacyFormatter {
                 ret.push_str(&system_prompt);
                 for (i, (role, content)) in messages.iter().enumerate() {
                     if content.is_empty() {
-                        ret.push_str(&format!("{role}:\n"));
+                        let _ = writeln!(ret, "{role}:");
                     } else {
-                        ret.push_str(&format!(
-                            "{role}:\n{content}{}",
-                            sep_even_odd(spec, sep2, i)
-                        ));
+                        let _ = write!(ret, "{role}:\n{content}{}", sep_even_odd(spec, sep2, i));
                         if i % 2 == 1 {
                             ret.push_str("\n\n");
                         }
@@ -375,9 +374,9 @@ impl LegacyFormatter {
                 ret.push_str(&system_prompt);
                 for (role, content) in messages {
                     if content.is_empty() {
-                        ret.push_str(&format!("{role}: <s>"));
+                        let _ = write!(ret, "{role}: <s>");
                     } else {
-                        ret.push_str(&format!("{role}: <s>{content}</s>"));
+                        let _ = write!(ret, "{role}: <s>{content}</s>");
                     }
                 }
             }
@@ -386,9 +385,9 @@ impl LegacyFormatter {
                 ret.push_str(&spec.sep);
                 for (role, content) in messages {
                     if content.is_empty() {
-                        ret.push_str(&format!("{role}:\n"));
+                        let _ = writeln!(ret, "{role}:");
                     } else {
-                        ret.push_str(&format!("{role}:\n{content}{}", spec.sep));
+                        let _ = write!(ret, "{role}:\n{content}{}", spec.sep);
                     }
                 }
             }
@@ -399,9 +398,9 @@ impl LegacyFormatter {
                 }
                 for (role, content) in messages {
                     if content.is_empty() {
-                        ret.push_str(&format!("{role}:"));
+                        let _ = write!(ret, "{role}:");
                     } else {
-                        ret.push_str(&format!("{role}: {content}{}", spec.sep));
+                        let _ = write!(ret, "{role}: {content}{}", spec.sep);
                     }
                 }
             }
@@ -415,14 +414,14 @@ impl LegacyFormatter {
                     // Python: sep2 prefixes odd messages; sep ends even ones.
                     if content.is_empty() {
                         if i % 2 == 0 {
-                            ret.push_str(&format!("{role}:\n"));
+                            let _ = writeln!(ret, "{role}:");
                         } else {
-                            ret.push_str(&format!("{role}: {sep2}"));
+                            let _ = write!(ret, "{role}: {sep2}");
                         }
                     } else if i % 2 == 0 {
-                        ret.push_str(&format!("{role}:\n{content}{}", spec.sep));
+                        let _ = write!(ret, "{role}:\n{content}{}", spec.sep);
                     } else {
-                        ret.push_str(&format!("{role}: {sep2}{content}"));
+                        let _ = write!(ret, "{role}: {sep2}{content}");
                     }
                 }
             }
@@ -431,9 +430,9 @@ impl LegacyFormatter {
                 ret.push_str(&system_prompt);
                 for (i, (role, content)) in messages.iter().enumerate() {
                     if content.is_empty() {
-                        ret.push_str(&format!("{role}:"));
+                        let _ = write!(ret, "{role}:");
                     } else {
-                        ret.push_str(&format!("{role}: {content}{}", sep_even_odd(spec, sep2, i)));
+                        let _ = write!(ret, "{role}: {content}{}", sep_even_odd(spec, sep2, i));
                     }
                 }
             }
@@ -445,9 +444,9 @@ impl LegacyFormatter {
                 }
                 for (i, (role, content)) in messages.iter().enumerate() {
                     if content.is_empty() {
-                        ret.push_str(&format!("{role}:"));
+                        let _ = write!(ret, "{role}:");
                     } else {
-                        ret.push_str(&format!("{role}: {content}{}", sep_even_odd(spec, sep2, i)));
+                        let _ = write!(ret, "{role}: {content}{}", sep_even_odd(spec, sep2, i));
                     }
                 }
             }
@@ -457,9 +456,9 @@ impl LegacyFormatter {
                     if content.is_empty() {
                         ret.push_str(role);
                     } else if i == 0 {
-                        ret.push_str(&format!("{content}{}", spec.sep));
+                        let _ = write!(ret, "{content}{}", spec.sep);
                     } else {
-                        ret.push_str(&format!("{role}{content}{}", spec.sep));
+                        let _ = write!(ret, "{role}{content}{}", spec.sep);
                     }
                 }
             }
@@ -470,7 +469,7 @@ impl LegacyFormatter {
                     if content.is_empty() {
                         ret.push_str(role);
                     } else {
-                        ret.push_str(&format!("{role}{content}{}", spec.sep));
+                        let _ = write!(ret, "{role}{content}{}", spec.sep);
                     }
                 }
             }
@@ -482,7 +481,7 @@ impl LegacyFormatter {
                 let mut counter = 1usize;
                 for (role, content) in messages {
                     if content.is_empty() {
-                        ret.push_str(&format!("{role}\n"));
+                        let _ = writeln!(ret, "{role}");
                     } else {
                         let mut message = content.clone();
                         while message.contains(&spec.audio_token) {
@@ -497,7 +496,7 @@ impl LegacyFormatter {
                             message = message.replacen(&spec.audio_token, &indexed, 1);
                             counter += 1;
                         }
-                        ret.push_str(&format!("{role}\n{message}{}", spec.sep));
+                        let _ = write!(ret, "{role}\n{message}{}", spec.sep);
                     }
                 }
             }
@@ -505,9 +504,9 @@ impl LegacyFormatter {
                 ret.push_str(&system_prompt);
                 for (role, content) in messages {
                     if content.is_empty() {
-                        ret.push_str(&format!("{role}: "));
+                        let _ = write!(ret, "{role}: ");
                     } else if role == user_role {
-                        ret.push_str(&format!("{role}: "));
+                        let _ = write!(ret, "{role}: ");
                         if content.contains(&spec.image_token) {
                             ret.push_str(
                                 &content
@@ -518,7 +517,7 @@ impl LegacyFormatter {
                         }
                         ret.push('\n');
                     } else {
-                        ret.push_str(&format!("{role}: {content}{}", spec.sep));
+                        let _ = write!(ret, "{role}: {content}{}", spec.sep);
                     }
                 }
             }
@@ -532,7 +531,7 @@ impl LegacyFormatter {
                     if content.is_empty() {
                         ret.push_str(role);
                     } else {
-                        ret.push_str(&format!("{role}{content}{}", sep_even_odd(spec, sep2, i)));
+                        let _ = write!(ret, "{role}{content}{}", sep_even_odd(spec, sep2, i));
                     }
                 }
             }
