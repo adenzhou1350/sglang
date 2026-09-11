@@ -837,6 +837,10 @@ fn append_top_logprobs(
 }
 
 #[cfg(test)]
+#[path = "completions_performance_tests.rs"]
+mod performance_tests;
+
+#[cfg(test)]
 mod tests {
     use super::super::test_utils::{chunk, senders, submitted};
     use super::{
