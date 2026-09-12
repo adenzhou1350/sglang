@@ -192,11 +192,20 @@ def get_request_return_hidden_states_mode(
     return get_return_hidden_states_mode(return_hidden_states)
 
 
-def get_batch_return_hidden_states_mode(reqs: List[Req]) -> CaptureHiddenMode:
-    mode = CaptureHiddenMode.NULL
+def get_batch_request_metadata(
+    reqs: List[Req],
+) -> Tuple[bool, bool, CaptureHiddenMode]:
+    return_logprob = False
+    has_grammar = False
+    return_hidden_states_mode = CaptureHiddenMode.NULL
     for req in reqs:
-        mode = max(mode, req.return_hidden_states_mode)
-    return mode
+        if not return_logprob and req.return_logprob:
+            return_logprob = True
+        if not has_grammar and req.grammar:
+            has_grammar = True
+        if req.return_hidden_states_mode > return_hidden_states_mode:
+            return_hidden_states_mode = req.return_hidden_states_mode
+    return return_logprob, has_grammar, return_hidden_states_mode
 
 
 def need_return_hidden_states(
@@ -2406,9 +2415,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         chunked_req: Optional[Req] = None,
         dllm_config: Optional[DllmConfig] = None,
     ):
-        return_logprob = any(req.return_logprob for req in reqs)
-
-        return_hidden_states_mode = get_batch_return_hidden_states_mode(reqs)
+        return_logprob, has_grammar, return_hidden_states_mode = (
+            get_batch_request_metadata(reqs)
+        )
 
         batch = cls(
             reqs=reqs,
@@ -2418,7 +2427,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             model_config=model_config,
             enable_overlap=enable_overlap,
             return_logprob=return_logprob,
-            has_grammar=any(req.grammar for req in reqs),
+            has_grammar=has_grammar,
             device=req_to_token_pool.device,
             spec_algorithm=spec_algorithm,
             return_hidden_states=return_hidden_states_mode.need_capture(),
@@ -3491,7 +3500,20 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.encoder_lens = self.encoder_lens[keep_indices_device]
             self.encoder_lens_cpu = [self.encoder_lens_cpu[i] for i in keep_indices]
 
-        self.reqs = [self.reqs[i] for i in keep_indices]
+        filtered_reqs = []
+        return_logprob = False
+        has_grammar = False
+        return_hidden_states_mode = CaptureHiddenMode.NULL
+        for i in keep_indices:
+            req = self.reqs[i]
+            filtered_reqs.append(req)
+            if not return_logprob and req.return_logprob:
+                return_logprob = True
+            if not has_grammar and req.grammar:
+                has_grammar = True
+            if req.return_hidden_states_mode > return_hidden_states_mode:
+                return_hidden_states_mode = req.return_hidden_states_mode
+        self.reqs = filtered_reqs
         if self.multimodal_inputs is not None:
             self.multimodal_inputs = [self.multimodal_inputs[i] for i in keep_indices]
         self.req_pool_indices = self.req_pool_indices[keep_indices_device]
@@ -3519,7 +3541,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.mamba_cow_src_indices = None
         self.mamba_cow_dst_indices = None
         self.mamba_clear_indices = None
-        self.return_logprob = any(req.return_logprob for req in self.reqs)
+        self.return_logprob = return_logprob
         if self.return_logprob:
             self.top_logprobs_nums = [self.top_logprobs_nums[i] for i in keep_indices]
             self.token_ids_logprobs = [self.token_ids_logprobs[i] for i in keep_indices]
@@ -3527,8 +3549,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.top_logprobs_nums = None
             self.token_ids_logprobs = None
 
-        self.has_grammar = any(req.grammar for req in self.reqs)
-        self.return_hidden_states_mode = get_batch_return_hidden_states_mode(self.reqs)
+        self.has_grammar = has_grammar
+        self.return_hidden_states_mode = return_hidden_states_mode
         self.return_hidden_states = self.return_hidden_states_mode.need_capture()
 
         self.sampling_info.filter_batch(keep_indices, keep_indices_device)
