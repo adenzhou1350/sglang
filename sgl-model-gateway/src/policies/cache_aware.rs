@@ -64,7 +64,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use dashmap::DashMap;
-use rand::{seq::IteratorRandom, Rng};
+use rand::Rng;
 use smg_mesh::{tree_ops::TreeOperation, OptionalMeshSyncManager};
 use tracing::{debug, warn};
 
@@ -98,6 +98,40 @@ fn tree_key_for_worker(worker: &dyn Worker) -> String {
         pool_tag(worker.worker_type()),
         normalize_model_key(worker.model_id()),
     )
+}
+
+/// Select a uniformly random worker among those with the minimum observed load.
+/// Each load is consumed exactly once so concurrent load changes cannot invalidate
+/// a previously computed minimum.
+fn select_min_load_index<R: Rng + ?Sized>(
+    loads: impl IntoIterator<Item = (usize, usize)>,
+    rng: &mut R,
+) -> Option<usize> {
+    let loads: Vec<(usize, usize)> = loads.into_iter().collect();
+    let mut min_load = usize::MAX;
+    let mut min_load_idx = 0usize;
+    let mut min_count = 0usize;
+
+    for &(idx, load) in &loads {
+        if load < min_load {
+            min_load = load;
+            min_load_idx = idx;
+            min_count = 1;
+        } else if load == min_load {
+            min_count += 1;
+        }
+    }
+
+    match min_count {
+        0 => None,
+        1 => Some(min_load_idx),
+        count => loads
+            .iter()
+            .copied()
+            .filter(|&(_, load)| load == min_load)
+            .nth(rng.random_range(0..count))
+            .map(|(idx, _)| idx),
+    }
 }
 
 /// Cache-aware routing policy
@@ -326,21 +360,14 @@ impl CacheAwarePolicy {
             );
         }
 
-        // Use shortest queue when imbalanced. Tie break randomly.
-        // Snapshot load() (live atomic count of load). Without snapshot
-        // there could be no workers found matching min_load because of
-        // load update.
-        let loads: Vec<(usize, usize)> = healthy_indices
-            .iter()
-            .map(|&idx| (idx, workers[idx].load()))
-            .collect();
-        let min_load = loads.iter().map(|&(_, load)| load).min()?;
-        let min_load_idx = loads
-            .iter()
-            .copied()
-            .filter(|&(_, load)| load == min_load)
-            .map(|(idx, _)| idx)
-            .choose(&mut rand::rng())?;
+        // Use shortest queue when imbalanced. Snapshot each live load once and
+        // break ties uniformly with one random draw.
+        let min_load_idx = select_min_load_index(
+            healthy_indices
+                .iter()
+                .map(|&idx| (idx, workers[idx].load())),
+            &mut rand::rng(),
+        )?;
 
         // Even in imbalanced mode, update the tree to maintain cache state
         if let Some(text) = request_text {
@@ -449,21 +476,14 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
                     .position(|w| w.url() == tenant_url)
                     .filter(|&idx| workers[idx].is_healthy())
             } else {
-                // Low cache match: use worker with minimum load. Tie break randomly.
-                // Snapshot load() (live atomic count of load). Without snapshot
-                // there could be no workers found matching min_load because of
-                // load update.
-                let loads: Vec<(usize, usize)> = healthy_indices
-                    .iter()
-                    .map(|&idx| (idx, workers[idx].load()))
-                    .collect();
-                let min_load = loads.iter().map(|&(_, load)| load).min()?;
-                loads
-                    .iter()
-                    .copied()
-                    .filter(|&(_, load)| load == min_load)
-                    .map(|(idx, _)| idx)
-                    .choose(&mut rand::rng())
+                // Low cache match: snapshot each live load once and select a
+                // uniformly random minimum with one random draw.
+                select_min_load_index(
+                    healthy_indices
+                        .iter()
+                        .map(|&idx| (idx, workers[idx].load())),
+                    &mut rand::rng(),
+                )
             };
 
             if let Some(idx) = selected_idx {
@@ -558,8 +578,55 @@ impl Default for CacheAwarePolicy {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
+    use rand::{rngs::StdRng, SeedableRng};
+
     use super::*;
     use crate::core::{BasicWorkerBuilder, WorkerType};
+
+    #[test]
+    fn test_select_min_load_index_invariants() {
+        let mut rng = StdRng::seed_from_u64(0x51ba_f54);
+        assert_eq!(select_min_load_index([], &mut rng), None);
+        assert_eq!(select_min_load_index([(7, 42)], &mut rng), Some(7));
+
+        let observations = Cell::new(0);
+        let loads = [9, 3, 7, 3, 11];
+        let selected = select_min_load_index(
+            loads.iter().enumerate().map(|(idx, &load)| {
+                observations.set(observations.get() + 1);
+                (idx, load)
+            }),
+            &mut rng,
+        )
+        .unwrap();
+        assert!(matches!(selected, 1 | 3));
+        assert_eq!(observations.get(), loads.len());
+    }
+
+    #[test]
+    fn test_select_min_load_index_uniform_ties() {
+        let mut rng = StdRng::seed_from_u64(0x51ba_f54);
+        let loads = [9, 3, 7, 3, 11, 3];
+        let mut counts = [0usize; 3];
+
+        for _ in 0..6000 {
+            let selected = select_min_load_index(loads.iter().copied().enumerate(), &mut rng)
+                .expect("non-empty loads");
+            let bucket = match selected {
+                1 => 0,
+                3 => 1,
+                5 => 2,
+                other => panic!("selected non-minimum index {other}"),
+            };
+            counts[bucket] += 1;
+        }
+
+        for count in counts {
+            assert!((1800..=2200).contains(&count), "counts={counts:?}");
+        }
+    }
 
     #[tokio::test]
     async fn test_cache_aware_with_balanced_load() {
