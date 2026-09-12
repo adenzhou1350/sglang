@@ -294,6 +294,24 @@ struct ActiveLoadKey {
     kind: &'static str,
 }
 
+/// Stable handles for one worker's two active-load gauge series.
+///
+/// The active-load registry binds these once per worker and then updates the
+/// atomics directly on every request register/drop, avoiding repeated label
+/// allocation and map locking on the dispatch hot path.
+#[derive(Debug)]
+pub(crate) struct ActiveLoadGauges {
+    prefill_tokens: Arc<AtomicI64>,
+    decode_blocks: Arc<AtomicI64>,
+}
+
+impl ActiveLoadGauges {
+    pub(crate) fn set(&self, prefill_tokens: i64, decode_blocks: i64) {
+        self.prefill_tokens.store(prefill_tokens, Ordering::Relaxed);
+        self.decode_blocks.store(decode_blocks, Ordering::Relaxed);
+    }
+}
+
 #[derive(Debug, Hash, Eq, PartialEq, Clone)]
 struct PolicyDecisionKey {
     policy: String,
@@ -461,6 +479,25 @@ impl MetricsRegistry {
             .clone();
         drop(guard);
         gauge.store(value, Ordering::Relaxed);
+    }
+
+    /// Bind both active-load gauge series for a worker under one map lock.
+    pub(crate) fn active_load_gauges(&self, worker_url: &str) -> ActiveLoadGauges {
+        let mut guard = self.active_load.lock();
+        let mut gauge = |kind| {
+            Arc::clone(
+                guard
+                    .entry(ActiveLoadKey {
+                        worker_url: worker_url.to_owned(),
+                        kind,
+                    })
+                    .or_insert_with(|| Arc::new(AtomicI64::new(0))),
+            )
+        };
+        ActiveLoadGauges {
+            prefill_tokens: gauge(ActiveLoadKind::PrefillTokens.as_str()),
+            decode_blocks: gauge(ActiveLoadKind::DecodeBlocks.as_str()),
+        }
     }
 
     /// Bump `sgl_router_stale_requests_total{outcome}`.

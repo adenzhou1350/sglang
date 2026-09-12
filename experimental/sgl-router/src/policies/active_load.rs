@@ -42,11 +42,11 @@
 //! type whose `duration_since(other)` returns the wall-clock delta.
 
 use crate::discovery::WorkerId;
-use crate::server::metrics::{ActiveLoadKind, MetricsRegistry};
+use crate::server::metrics::{ActiveLoadGauges, MetricsRegistry};
 use dashmap::DashMap;
 use parking_lot::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -80,6 +80,7 @@ impl std::fmt::Display for RequestId {
 struct WorkerCounters {
     prefill_load: AtomicUsize,
     decode_load: AtomicUsize,
+    gauges: OnceLock<ActiveLoadGauges>,
 }
 
 /// Per-request bookkeeping the janitor consults to find expired requests.
@@ -176,13 +177,13 @@ pub struct ActiveLoadRegistry {
     requests: DashMap<RequestId, RequestEntry>,
     clock: Arc<dyn Clock>,
     stale_request_timeout: Duration,
-    /// Optional Prometheus metrics sink. When attached via
+    /// Optional Prometheus metrics sink. When attached once via
     /// [`Self::attach_metrics`] (typically from `AppContext`), every
     /// `register` / drop / `sweep_stale` emits the live per-worker
     /// `sgl_router_active_load` gauge for both axes. Late binding via
-    /// `Mutex<Option<...>>` keeps construction order flexible: the
-    /// registry can be created before the metrics registry exists.
-    metrics: Mutex<Option<Arc<MetricsRegistry>>>,
+    /// `OnceLock` keeps construction order flexible while making steady-state
+    /// request accounting lock-free after each worker binds its gauge handles.
+    metrics: OnceLock<Arc<MetricsRegistry>>,
 }
 
 impl ActiveLoadRegistry {
@@ -199,16 +200,17 @@ impl ActiveLoadRegistry {
             requests: DashMap::new(),
             clock,
             stale_request_timeout,
-            metrics: Mutex::new(None),
+            metrics: OnceLock::new(),
         })
     }
 
-    /// Attach (or replace) the [`MetricsRegistry`] this registry pushes
-    /// gauge updates into. Idempotent; safe to call multiple times.
+    /// Attach the [`MetricsRegistry`] this registry pushes gauge updates into.
+    /// The first attachment wins, matching the single `AppContext` metrics
+    /// registry used in production.
     /// Production wires this from `AppContext` after the metrics registry
     /// is constructed; tests skip it unless they assert on the gauge.
     pub fn attach_metrics(&self, metrics: Arc<MetricsRegistry>) {
-        *self.metrics.lock() = Some(metrics);
+        let _ = self.metrics.set(metrics);
     }
 
     /// Snapshot the current per-worker load and push it to the metrics
@@ -218,19 +220,16 @@ impl ActiveLoadRegistry {
     /// eventually-consistent with the canonical counter even under
     /// concurrent register + drop interleavings.
     fn publish_gauge(&self, counters: &WorkerCounters, worker_url: &str) {
-        let Some(metrics) = self.metrics.lock().clone() else {
+        let Some(metrics) = self.metrics.get() else {
             return;
         };
-        metrics.set_active_load(
-            worker_url,
-            ActiveLoadKind::PrefillTokens,
-            counters.prefill_load.load(Ordering::Relaxed) as i64,
-        );
-        metrics.set_active_load(
-            worker_url,
-            ActiveLoadKind::DecodeBlocks,
-            counters.decode_load.load(Ordering::Relaxed) as i64,
-        );
+        counters
+            .gauges
+            .get_or_init(|| metrics.active_load_gauges(worker_url))
+            .set(
+                counters.prefill_load.load(Ordering::Relaxed) as i64,
+                counters.decode_load.load(Ordering::Relaxed) as i64,
+            );
     }
 
     /// Default-config registry: monotonic system clock + 10-minute stale
