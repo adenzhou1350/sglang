@@ -259,8 +259,8 @@ struct LoadEntry {
     at: Instant,
 }
 
-type NativeRankObservation = (LoadStat, Option<NativeCacheRankLoad>, bool, Instant);
-type NativeWorkerObservations = HashMap<u32, NativeRankObservation>;
+type RankObservation = (LoadStat, Option<NativeCacheRankLoad>, bool, Instant);
+type WorkerObservations = HashMap<u32, RankObservation>;
 
 /// Per-`(worker_url, dp_rank)` engine-reported load, written by the load
 /// subscriber pump and captured once at request ingress.
@@ -329,84 +329,19 @@ impl EngineLoadTable {
             .len()
     }
 
-    /// Shared accumulation pass behind [`Self::capture_snapshot`]. It sums
-    /// fields across ranks and keeps the oldest snapshot timestamp, but only for workers whose
-    /// every advertised rank is present and fresh**. A missing or stale rank is
-    /// omitted, so the caller falls back to its own load signal. (Summing
-    /// only the fresh ranks would make a worker whose other ranks went silent
-    /// look misleadingly idle and draw *more* traffic.) Callers that never
-    /// registered expected ranks retain the all-known-ranks rule. The oldest
-    /// timestamp represents the freshness of the complete aggregate.
-    fn fresh_worker_loads(&self, now: Instant) -> HashMap<String, EngineWorkerLoad> {
-        // url -> rank -> (reported load, fresh, timestamp).
-        let mut observed: HashMap<String, HashMap<u32, (LoadStat, bool, Instant)>> = HashMap::new();
-        for entry in self.by_rank.iter() {
-            let at = entry.value().at;
-            let fresh = now.saturating_duration_since(at) <= self.freshness;
-            observed
-                .entry(entry.key().0.clone())
-                .or_default()
-                .insert(entry.key().1, (entry.value().load.clone(), fresh, at));
-        }
-        let mut expected: HashMap<String, HashSet<u32>> = HashMap::new();
-        for entry in self.expected.iter() {
-            expected
-                .entry(entry.key().0.clone())
-                .or_default()
-                .insert(entry.key().1);
-        }
-
-        let workers: HashSet<String> = observed.keys().chain(expected.keys()).cloned().collect();
-        workers
-            .into_iter()
-            .filter_map(|url| {
-                let ranks = observed.get(&url)?;
-                let required: Vec<u32> = match expected.get(&url) {
-                    Some(expected_ranks) => expected_ranks.iter().copied().collect(),
-                    None => ranks.keys().copied().collect(),
-                };
-                let mut num_running_reqs = 0u64;
-                let mut num_waiting_reqs = 0u64;
-                let mut num_tokens = 0u64;
-                let mut max_total_num_tokens = 0u64;
-                let mut oldest_at = None;
-                for rank in required {
-                    let (load, fresh, at) = ranks.get(&rank)?;
-                    if !fresh {
-                        return None;
-                    }
-                    num_running_reqs = num_running_reqs.saturating_add(load.num_running_reqs);
-                    num_waiting_reqs = num_waiting_reqs.saturating_add(load.num_waiting_reqs);
-                    num_tokens = num_tokens.saturating_add(load.num_tokens);
-                    max_total_num_tokens =
-                        max_total_num_tokens.saturating_add(load.max_total_num_tokens);
-                    oldest_at = Some(oldest_at.map_or(*at, |oldest: Instant| oldest.min(*at)));
-                }
-                oldest_at.map(|captured_at| {
-                    (
-                        url,
-                        EngineWorkerLoad {
-                            num_running_reqs,
-                            num_waiting_reqs,
-                            num_tokens,
-                            max_total_num_tokens,
-                            captured_at,
-                        },
-                    )
-                })
-            })
-            .collect()
-    }
-
-    /// Aggregates complete native Cache-Aware monitor data.
+    /// Builds both snapshot views from one observation and aggregation pass.
     ///
-    /// Every rank must be fresh, capacity-valid, and include the #34608
-    /// extension. Otherwise the worker is omitted from monitor-backed guards.
-    fn fresh_native_cache_worker_loads(
+    /// Every advertised rank must be present and fresh for the generic view.
+    /// Native Cache-Aware additionally requires capacity-valid extension data
+    /// from every rank; otherwise only the generic view is retained.
+    fn fresh_worker_loads(
         &self,
         now: Instant,
-    ) -> HashMap<String, NativeCacheWorkerLoad> {
-        let mut observed: HashMap<String, NativeWorkerObservations> = HashMap::new();
+    ) -> (
+        HashMap<String, EngineWorkerLoad>,
+        HashMap<String, NativeCacheWorkerLoad>,
+    ) {
+        let mut observed: HashMap<String, WorkerObservations> = HashMap::new();
         for entry in self.by_rank.iter() {
             let at = entry.value().at;
             let fresh = now.saturating_duration_since(at) <= self.freshness;
@@ -427,97 +362,135 @@ impl EngineLoadTable {
                 .or_default()
                 .insert(entry.key().1);
         }
+
         let workers: HashSet<String> = observed.keys().chain(expected.keys()).cloned().collect();
-        workers
-            .into_iter()
-            .filter_map(|url| {
-                let ranks = observed.get(&url)?;
-                let required: Vec<u32> = match expected.get(&url) {
-                    Some(expected_ranks) => expected_ranks.iter().copied().collect(),
-                    None => ranks.keys().copied().collect(),
+        let mut basic_workers = HashMap::with_capacity(workers.len());
+        let mut native_workers = HashMap::with_capacity(workers.len());
+
+        for url in workers {
+            let Some(ranks) = observed.get(&url) else {
+                continue;
+            };
+            let required: Vec<u32> = match expected.get(&url) {
+                Some(expected_ranks) => expected_ranks.iter().copied().collect(),
+                None => ranks.keys().copied().collect(),
+            };
+
+            let mut num_running_reqs = 0u64;
+            let mut num_waiting_reqs = 0u64;
+            let mut num_tokens = 0u64;
+            let mut max_total_num_tokens = 0u64;
+            let mut oldest_at = None;
+
+            let mut native_valid = !required.is_empty();
+            let mut num_waiting_uncached_tokens = 0u64;
+            let mut num_total_tokens = 0u64;
+            let mut max_running_requests = 0u64;
+            let mut prefill_throughput_tokens_per_s = 0.0f64;
+            let mut complete_prefill_sample = native_valid;
+            let mut basic_valid = true;
+
+            for rank in required {
+                let Some((load, previous, fresh, at)) = ranks.get(&rank) else {
+                    basic_valid = false;
+                    break;
                 };
-                let mut num_running_reqs = 0u64;
-                let mut num_waiting_reqs = 0u64;
-                let mut num_waiting_uncached_tokens = 0u64;
-                let mut num_used_tokens = 0u64;
-                let mut num_total_tokens = 0u64;
-                let mut max_total_num_tokens = 0u64;
-                let mut max_running_requests = 0u64;
-                let mut oldest_at = None;
-                let mut prefill_throughput_tokens_per_s = 0.0f64;
-                let mut complete_prefill_sample = !required.is_empty();
-
-                for rank in required {
-                    let (load, previous, fresh, at) = ranks.get(&rank)?;
-                    let native = load.native_cache.as_ref()?;
-                    if !fresh || load.max_total_num_tokens == 0 || native.max_running_requests == 0
-                    {
-                        return None;
-                    }
-                    num_running_reqs = num_running_reqs.saturating_add(load.num_running_reqs);
-                    num_waiting_reqs = num_waiting_reqs.saturating_add(load.num_waiting_reqs);
-                    num_waiting_uncached_tokens = num_waiting_uncached_tokens
-                        .saturating_add(native.num_waiting_uncached_tokens);
-                    num_used_tokens = num_used_tokens.saturating_add(load.num_tokens);
-                    num_total_tokens = num_total_tokens.saturating_add(native.num_total_tokens);
-                    max_total_num_tokens =
-                        max_total_num_tokens.saturating_add(load.max_total_num_tokens);
-                    max_running_requests =
-                        max_running_requests.saturating_add(native.max_running_requests);
-                    oldest_at = Some(oldest_at.map_or(*at, |oldest: Instant| oldest.min(*at)));
-
-                    match previous {
-                        Some(previous)
-                            if native.total_prefill_uncached_tokens
-                                > previous.total_prefill_uncached_tokens
-                                && native.total_prefill_busy_us
-                                    > previous.total_prefill_busy_us =>
-                        {
-                            let tokens = native.total_prefill_uncached_tokens
-                                - previous.total_prefill_uncached_tokens;
-                            let busy_us =
-                                native.total_prefill_busy_us - previous.total_prefill_busy_us;
-                            let rate = 1_000_000.0 * tokens as f64 / busy_us as f64;
-                            if rate.is_finite() && rate > 0.0 {
-                                prefill_throughput_tokens_per_s += rate;
-                            } else {
-                                complete_prefill_sample = false;
-                            }
-                        }
-                        _ => complete_prefill_sample = false,
-                    }
+                if !fresh {
+                    basic_valid = false;
+                    break;
                 }
+
+                num_running_reqs = num_running_reqs.saturating_add(load.num_running_reqs);
+                num_waiting_reqs = num_waiting_reqs.saturating_add(load.num_waiting_reqs);
+                num_tokens = num_tokens.saturating_add(load.num_tokens);
+                max_total_num_tokens =
+                    max_total_num_tokens.saturating_add(load.max_total_num_tokens);
+                oldest_at = Some(oldest_at.map_or(*at, |oldest: Instant| oldest.min(*at)));
+
+                if !native_valid {
+                    continue;
+                }
+                let Some(native) = load.native_cache.as_ref() else {
+                    native_valid = false;
+                    continue;
+                };
+                if load.max_total_num_tokens == 0 || native.max_running_requests == 0 {
+                    native_valid = false;
+                    continue;
+                }
+                num_waiting_uncached_tokens =
+                    num_waiting_uncached_tokens.saturating_add(native.num_waiting_uncached_tokens);
+                num_total_tokens = num_total_tokens.saturating_add(native.num_total_tokens);
+                max_running_requests =
+                    max_running_requests.saturating_add(native.max_running_requests);
+
+                match previous {
+                    Some(previous)
+                        if native.total_prefill_uncached_tokens
+                            > previous.total_prefill_uncached_tokens
+                            && native.total_prefill_busy_us > previous.total_prefill_busy_us =>
+                    {
+                        let tokens = native.total_prefill_uncached_tokens
+                            - previous.total_prefill_uncached_tokens;
+                        let busy_us = native.total_prefill_busy_us - previous.total_prefill_busy_us;
+                        let rate = 1_000_000.0 * tokens as f64 / busy_us as f64;
+                        if rate.is_finite() && rate > 0.0 {
+                            prefill_throughput_tokens_per_s += rate;
+                        } else {
+                            complete_prefill_sample = false;
+                        }
+                    }
+                    _ => complete_prefill_sample = false,
+                }
+            }
+
+            let Some(captured_at) = basic_valid.then_some(oldest_at).flatten() else {
+                continue;
+            };
+            basic_workers.insert(
+                url.clone(),
+                EngineWorkerLoad {
+                    num_running_reqs,
+                    num_waiting_reqs,
+                    num_tokens,
+                    max_total_num_tokens,
+                    captured_at,
+                },
+            );
+
+            if native_valid {
                 let prefill_throughput_tokens_per_s =
                     complete_prefill_sample.then_some(prefill_throughput_tokens_per_s);
                 let estimated_prefill_queue_ms = prefill_throughput_tokens_per_s
                     .map(|rate| 1_000.0 * num_waiting_uncached_tokens as f64 / rate);
-                oldest_at.map(|captured_at| {
-                    (
-                        url,
-                        NativeCacheWorkerLoad {
-                            num_running_reqs,
-                            num_waiting_reqs,
-                            num_waiting_uncached_tokens,
-                            num_used_tokens,
-                            num_total_tokens,
-                            max_total_num_tokens,
-                            max_running_requests,
-                            prefill_throughput_tokens_per_s,
-                            estimated_prefill_queue_ms,
-                            captured_at,
-                        },
-                    )
-                })
-            })
-            .collect()
+                native_workers.insert(
+                    url,
+                    NativeCacheWorkerLoad {
+                        num_running_reqs,
+                        num_waiting_reqs,
+                        num_waiting_uncached_tokens,
+                        num_used_tokens: num_tokens,
+                        num_total_tokens,
+                        max_total_num_tokens,
+                        max_running_requests,
+                        prefill_throughput_tokens_per_s,
+                        estimated_prefill_queue_ms,
+                        captured_at,
+                    },
+                );
+            }
+        }
+
+        (basic_workers, native_workers)
     }
 
     /// Captures one immutable view for all routing decisions in a request.
     pub fn capture_snapshot(&self, now: Instant) -> EngineLoadSnapshot {
+        let (workers, native_cache_workers) = self.fresh_worker_loads(now);
         EngineLoadSnapshot {
             version: self.version.load(Ordering::Acquire),
-            workers: self.fresh_worker_loads(now),
-            native_cache_workers: self.fresh_native_cache_worker_loads(now),
+            workers,
+            native_cache_workers,
         }
     }
 
@@ -616,6 +589,37 @@ mod tests {
         // (5+1) + (3+2) = 11
         let load = fresh.fresh_load_for_url("http://w:30000").unwrap();
         assert_eq!(load.num_running_reqs + load.num_waiting_reqs, 11);
+    }
+
+    #[test]
+    fn snapshot_keeps_generic_load_when_native_extension_is_incomplete() {
+        let t = EngineLoadTable::new();
+        let now = Instant::now();
+        t.mark_expected_rank("http://w:30000", 0);
+        t.mark_expected_rank("http://w:30000", 1);
+
+        let mut extended = load(5, 1);
+        extended.num_tokens = 10;
+        extended.max_total_num_tokens = 100;
+        extended.native_cache = Some(NativeCacheRankLoad {
+            num_waiting_uncached_tokens: 4,
+            num_total_tokens: 20,
+            max_running_requests: 8,
+            total_prefill_uncached_tokens: 30,
+            total_prefill_busy_us: 40,
+        });
+        t.set("http://w:30000", 0, extended, now);
+        t.set("http://w:30000", 1, load(3, 2), now);
+
+        let snapshot = t.capture_snapshot(now);
+        let generic = snapshot
+            .fresh_load_for_url("http://w:30000")
+            .expect("generic load remains usable when only one rank has native data");
+        assert_eq!(generic.num_running_reqs, 8);
+        assert_eq!(generic.num_waiting_reqs, 3);
+        assert!(snapshot
+            .fresh_native_cache_load_for_url("http://w:30000")
+            .is_none());
     }
 
     #[test]
