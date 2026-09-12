@@ -289,19 +289,26 @@ fn stable_backup(
     session_id: &str,
     candidate_range_id: &str,
 ) -> Option<Arc<Worker>> {
-    let mut others: Vec<Arc<Worker>> = workers
+    let mut others: Vec<(usize, &Arc<Worker>)> = workers
         .iter()
-        .filter(|worker| worker.id != primary.id)
-        .cloned()
+        .enumerate()
+        .filter(|(_, worker)| worker.id != primary.id)
         .collect();
-    others.sort_by(|left, right| left.id.0.cmp(&right.id.0));
     if others.is_empty() {
         return None;
     }
     let mut hasher = DefaultHasher::new();
     session_id.hash(&mut hasher);
     candidate_range_id.hash(&mut hasher);
-    Some(others[(hasher.finish() as usize) % others.len()].clone())
+    let selected = (hasher.finish() as usize) % others.len();
+    let (_, (_, worker), _) = others.select_nth_unstable_by(selected, |left, right| {
+        left.1
+            .id
+            .0
+            .cmp(&right.1.id.0)
+            .then_with(|| left.0.cmp(&right.0))
+    });
+    Some(Arc::clone(worker))
 }
 
 #[cfg(test)]
@@ -313,13 +320,52 @@ mod lifecycle_tests {
     use std::time::{Duration, Instant};
 
     fn worker(id: &str) -> Arc<Worker> {
+        worker_at(id, &format!("http://{id}:30000"))
+    }
+
+    fn worker_at(id: &str, url: &str) -> Arc<Worker> {
         Arc::new(Worker::new(WorkerSpec {
             id: WorkerId(id.into()),
-            url: format!("http://{id}:30000"),
+            url: url.into(),
             mode: WorkerMode::Plain,
             model_ids: vec![ModelId("model".into())],
             bootstrap_port: None,
         }))
+    }
+
+    #[test]
+    fn stable_backup_matches_stable_sort_for_duplicates_and_permutations() {
+        let primary = worker("primary");
+        let pool = [
+            Arc::clone(&primary),
+            worker_at("b", "http://b-first:30000"),
+            worker("a"),
+            worker_at("b", "http://b-second:30000"),
+            worker("c"),
+        ];
+
+        for rotation in 0..pool.len() {
+            let mut workers = pool.to_vec();
+            workers.rotate_left(rotation);
+            let mut sorted: Vec<_> = workers
+                .iter()
+                .filter(|worker| worker.id != primary.id)
+                .collect();
+            sorted.sort_by(|left, right| left.id.0.cmp(&right.id.0));
+
+            for session in 0..32 {
+                let session_id = format!("session-{session}");
+                for candidate_range_id in ["", "global", "bucket-7"] {
+                    let mut hasher = DefaultHasher::new();
+                    session_id.hash(&mut hasher);
+                    candidate_range_id.hash(&mut hasher);
+                    let expected = sorted[(hasher.finish() as usize) % sorted.len()];
+                    let actual =
+                        stable_backup(&workers, &primary, &session_id, candidate_range_id).unwrap();
+                    assert!(Arc::ptr_eq(&actual, expected));
+                }
+            }
+        }
     }
 
     #[test]
