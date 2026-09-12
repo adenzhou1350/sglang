@@ -80,7 +80,9 @@ impl std::fmt::Display for RequestId {
 struct WorkerCounters {
     prefill_load: AtomicUsize,
     decode_load: AtomicUsize,
-    gauges: OnceLock<ActiveLoadGauges>,
+    /// A discovery upsert may reuse a WorkerId with a different URL. Cache by
+    /// URL so every in-flight RequestEntry keeps publishing to its own series.
+    gauges: DashMap<String, ActiveLoadGauges>,
 }
 
 /// Per-request bookkeeping the janitor consults to find expired requests.
@@ -181,8 +183,8 @@ pub struct ActiveLoadRegistry {
     /// [`Self::attach_metrics`] (typically from `AppContext`), every
     /// `register` / drop / `sweep_stale` emits the live per-worker
     /// `sgl_router_active_load` gauge for both axes. Late binding via
-    /// `OnceLock` keeps construction order flexible while making steady-state
-    /// request accounting lock-free after each worker binds its gauge handles.
+    /// `OnceLock` keeps construction order flexible. Per-worker gauge handles
+    /// remove process-wide metrics-map locking from steady-state accounting.
     metrics: OnceLock<Arc<MetricsRegistry>>,
 }
 
@@ -223,13 +225,17 @@ impl ActiveLoadRegistry {
         let Some(metrics) = self.metrics.get() else {
             return;
         };
+        let prefill_load = counters.prefill_load.load(Ordering::Relaxed) as i64;
+        let decode_load = counters.decode_load.load(Ordering::Relaxed) as i64;
+        if let Some(gauges) = counters.gauges.get(worker_url) {
+            gauges.set(prefill_load, decode_load);
+            return;
+        }
         counters
             .gauges
-            .get_or_init(|| metrics.active_load_gauges(worker_url))
-            .set(
-                counters.prefill_load.load(Ordering::Relaxed) as i64,
-                counters.decode_load.load(Ordering::Relaxed) as i64,
-            );
+            .entry(worker_url.to_owned())
+            .or_insert_with(|| metrics.active_load_gauges(worker_url))
+            .set(prefill_load, decode_load);
     }
 
     /// Default-config registry: monotonic system clock + 10-minute stale
@@ -890,6 +896,38 @@ mod tests {
             ),
             "expected decode_blocks=0 after drop, got:\n{rendered}"
         );
+    }
+
+    #[test]
+    fn metrics_gauge_preserves_url_series_across_same_id_upsert() {
+        use crate::server::metrics::MetricsRegistry;
+
+        let (registry, _) = registry_with_mock_clock(Duration::from_secs(60));
+        let metrics = MetricsRegistry::new();
+        registry.attach_metrics(Arc::clone(&metrics));
+        let worker = WorkerId("w0".into());
+
+        let old = registry.register(worker.clone(), "http://old:30000", 10, 1);
+        let new = registry.register(worker, "http://new:30000", 20, 2);
+        let rendered = metrics.render();
+        assert!(rendered.contains(
+            "sgl_router_active_load{worker_url=\"http://old:30000\",kind=\"prefill_tokens\"} 10"
+        ));
+        assert!(rendered.contains(
+            "sgl_router_active_load{worker_url=\"http://new:30000\",kind=\"prefill_tokens\"} 30"
+        ));
+
+        // Each in-flight entry must continue publishing to the URL captured
+        // at its own registration, matching the pre-cache behavior.
+        drop(old);
+        drop(new);
+        let rendered = metrics.render();
+        assert!(rendered.contains(
+            "sgl_router_active_load{worker_url=\"http://old:30000\",kind=\"prefill_tokens\"} 20"
+        ));
+        assert!(rendered.contains(
+            "sgl_router_active_load{worker_url=\"http://new:30000\",kind=\"prefill_tokens\"} 0"
+        ));
     }
 
     #[test]
