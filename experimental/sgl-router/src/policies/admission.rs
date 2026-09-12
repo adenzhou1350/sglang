@@ -491,10 +491,14 @@ fn materially_more_pressured(
 ///
 /// External values are compared only when every candidate is present. Mixed
 /// candidate sets use Router-local active load to preserve ordering.
+struct FreshWorkerLoad<'a> {
+    native: Option<&'a NativeCacheWorkerLoad>,
+    basic: Option<&'a crate::policies::engine_load::EngineWorkerLoad>,
+    local_active: usize,
+}
+
 pub(crate) struct FreshLoadLookup<'a> {
-    by_worker_id: HashMap<String, &'a NativeCacheWorkerLoad>,
-    basic_by_worker_id: HashMap<String, &'a crate::policies::engine_load::EngineWorkerLoad>,
-    local_active_by_worker_id: HashMap<String, usize>,
+    by_worker_id: HashMap<String, FreshWorkerLoad<'a>>,
     compare_engine: bool,
     compare_basic_engine: bool,
 }
@@ -504,39 +508,34 @@ impl<'a> FreshLoadLookup<'a> {
         snapshot: Option<&'a EngineLoadSnapshot>,
         workers: impl IntoIterator<Item = &'w Arc<Worker>>,
     ) -> Self {
-        let workers: Vec<&Arc<Worker>> = workers.into_iter().collect();
-        let local_active_by_worker_id: HashMap<String, usize> = workers
-            .iter()
-            .map(|worker| (worker.id.0.clone(), worker.active_load()))
-            .collect();
-        let by_worker_id = snapshot
-            .into_iter()
-            .flat_map(|snapshot| {
-                workers.iter().filter_map(move |worker| {
-                    snapshot
-                        .fresh_native_cache_load_for_url(&worker.url)
-                        .map(|load| (worker.id.0.clone(), load))
-                })
-            })
-            .collect::<HashMap<_, _>>();
-        let basic_by_worker_id = snapshot
-            .into_iter()
-            .flat_map(|snapshot| {
-                workers.iter().filter_map(move |worker| {
-                    snapshot
-                        .fresh_load_for_url(&worker.url)
-                        .map(|load| (worker.id.0.clone(), load))
-                })
-            })
-            .collect::<HashMap<_, _>>();
-        let compare_engine = !local_active_by_worker_id.is_empty()
-            && by_worker_id.len() == local_active_by_worker_id.len();
-        let compare_basic_engine = !local_active_by_worker_id.is_empty()
-            && basic_by_worker_id.len() == local_active_by_worker_id.len();
+        let workers = workers.into_iter();
+        let capacity = workers.size_hint().0;
+        let mut by_worker_id = HashMap::with_capacity(capacity);
+        for worker in workers {
+            let local_active = worker.active_load();
+            let entry = by_worker_id
+                .entry(worker.id.0.clone())
+                .or_insert(FreshWorkerLoad {
+                    native: None,
+                    basic: None,
+                    local_active,
+                });
+            entry.local_active = local_active;
+            if let Some(snapshot) = snapshot {
+                if let Some(load) = snapshot.fresh_native_cache_load_for_url(&worker.url) {
+                    entry.native = Some(load);
+                }
+                if let Some(load) = snapshot.fresh_load_for_url(&worker.url) {
+                    entry.basic = Some(load);
+                }
+            }
+        }
+        let compare_engine =
+            !by_worker_id.is_empty() && by_worker_id.values().all(|entry| entry.native.is_some());
+        let compare_basic_engine =
+            !by_worker_id.is_empty() && by_worker_id.values().all(|entry| entry.basic.is_some());
         Self {
             by_worker_id,
-            basic_by_worker_id,
-            local_active_by_worker_id,
             compare_engine,
             compare_basic_engine,
         }
@@ -546,7 +545,9 @@ impl<'a> FreshLoadLookup<'a> {
         &self,
         worker_id: &crate::discovery::WorkerId,
     ) -> Option<&'a NativeCacheWorkerLoad> {
-        self.by_worker_id.get(worker_id.0.as_str()).copied()
+        self.by_worker_id
+            .get(worker_id.0.as_str())
+            .and_then(|entry| entry.native)
     }
 
     fn comparable_get(
@@ -557,13 +558,13 @@ impl<'a> FreshLoadLookup<'a> {
     }
 
     fn pressure_key(&self, worker: &Arc<Worker>) -> PressureKey<'a> {
+        let entry = self.by_worker_id.get(worker.id.0.as_str());
         PressureKey {
-            load: self.comparable_get(&worker.id),
-            local_active: self
-                .local_active_by_worker_id
-                .get(worker.id.0.as_str())
-                .copied()
-                .unwrap_or(usize::MAX),
+            load: self
+                .compare_engine
+                .then(|| entry.and_then(|entry| entry.native))
+                .flatten(),
+            local_active: entry.map_or(usize::MAX, |entry| entry.local_active),
         }
     }
 
@@ -593,10 +594,11 @@ impl<'a> FreshLoadLookup<'a> {
 
     pub(crate) fn prefill_pressure_source(&self) -> &'static str {
         if self.compare_engine
-            && self
-                .by_worker_id
-                .values()
-                .all(|load| load.estimated_prefill_queue_ms.is_some())
+            && self.by_worker_id.values().all(|entry| {
+                entry
+                    .native
+                    .is_some_and(|load| load.estimated_prefill_queue_ms.is_some())
+            })
         {
             "estimated_prefill_queue_ms"
         } else if self.compare_engine {
@@ -612,26 +614,24 @@ impl<'a> FreshLoadLookup<'a> {
     /// whole set uses Router-local active load. Dispatches after the snapshot
     /// are added to the reported value.
     pub(crate) fn score_load(&self, worker: &Arc<Worker>) -> usize {
-        self.compare_basic_engine
-            .then(|| self.basic_by_worker_id.get(worker.id.0.as_str()).copied())
+        let entry = self.by_worker_id.get(worker.id.0.as_str());
+        if let Some(load) = self
+            .compare_basic_engine
+            .then(|| entry.and_then(|entry| entry.basic))
             .flatten()
-            .map(|load| {
-                let recent_dispatches = worker
-                    .slots_acquired_since(load.captured_at)
-                    .try_into()
-                    .unwrap_or(u64::MAX);
-                load.num_waiting_reqs
-                    .saturating_add(load.num_running_reqs)
-                    .saturating_add(recent_dispatches)
-                    .try_into()
-                    .unwrap_or(usize::MAX)
-            })
-            .unwrap_or_else(|| {
-                self.local_active_by_worker_id
-                    .get(worker.id.0.as_str())
-                    .copied()
-                    .unwrap_or(usize::MAX)
-            })
+        {
+            let recent_dispatches = worker
+                .slots_acquired_since(load.captured_at)
+                .try_into()
+                .unwrap_or(u64::MAX);
+            return load
+                .num_waiting_reqs
+                .saturating_add(load.num_running_reqs)
+                .saturating_add(recent_dispatches)
+                .try_into()
+                .unwrap_or(usize::MAX);
+        }
+        entry.map_or(usize::MAX, |entry| entry.local_active)
     }
     fn min_by_pressure_key(
         &self,
