@@ -18,6 +18,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use dashmap::mapref::entry::Entry;
 use dashmap::{DashMap, DashSet};
 use serde::de::{self, Deserializer, IgnoredAny, SeqAccess, Visitor};
 use serde::Deserialize;
@@ -298,18 +299,23 @@ impl EngineLoadTable {
     /// Record the latest load for one `(worker_url, dp_rank)`.
     pub fn set(&self, url: &str, dp_rank: u32, load: LoadStat, at: Instant) {
         let key = (url.to_string(), dp_rank);
-        let previous_native_cache = self
-            .by_rank
-            .get(&key)
-            .and_then(|entry| entry.load.native_cache.clone());
-        self.by_rank.insert(
-            key,
-            LoadEntry {
-                load,
-                previous_native_cache,
-                at,
-            },
-        );
+        match self.by_rank.entry(key) {
+            Entry::Occupied(mut entry) => {
+                let previous_native_cache = entry.get().load.native_cache.clone();
+                entry.insert(LoadEntry {
+                    load,
+                    previous_native_cache,
+                    at,
+                });
+            }
+            Entry::Vacant(entry) => {
+                entry.insert(LoadEntry {
+                    load,
+                    previous_native_cache: None,
+                    at,
+                });
+            }
+        }
         self.version.fetch_add(1, Ordering::Relaxed);
     }
 
