@@ -34,6 +34,18 @@ use std::sync::Arc;
 use super::{LoadBalancingPolicy, SelectWorkerInfo};
 use crate::{core::Worker, observability::metrics::Metrics};
 
+#[inline]
+fn encode_prefix_hash(mut prefix_hash: u64) -> [u8; 16] {
+    const HEX_DIGITS: &[u8; 16] = b"0123456789abcdef";
+
+    let mut key = [b'0'; 16];
+    for digit in key.iter_mut().rev() {
+        *digit = HEX_DIGITS[(prefix_hash & 0xf) as usize];
+        prefix_hash >>= 4;
+    }
+    key
+}
+
 /// Configuration for the PrefixHash load balancing policy
 #[derive(Debug, Clone)]
 pub struct PrefixHashConfig {
@@ -151,7 +163,8 @@ impl PrefixHashPolicy {
         // Use pre-computed ring if available
         if let Some(ref ring) = info.hash_ring {
             // Convert prefix hash to a ring key string for lookup
-            let key = format!("{:016x}", prefix_hash);
+            let key = encode_prefix_hash(prefix_hash);
+            let key = std::str::from_utf8(&key).expect("hexadecimal digits are valid UTF-8");
 
             // Build URL to (index, worker) map for healthy workers
             let healthy_url_map: std::collections::HashMap<&str, (usize, &Arc<dyn Worker>)> =
@@ -257,6 +270,44 @@ mod tests {
                 ) as Arc<dyn Worker>
             })
             .collect()
+    }
+
+    #[test]
+    fn test_encode_prefix_hash_matches_fixed_width_format() {
+        let boundary_values = [
+            0,
+            1,
+            0xf,
+            0x10,
+            0xff,
+            0x100,
+            0xffff,
+            0x1_0000,
+            1 << 31,
+            1 << 32,
+            1 << 63,
+            u64::MAX,
+        ];
+
+        for value in boundary_values {
+            let encoded = encode_prefix_hash(value);
+            assert_eq!(
+                std::str::from_utf8(&encoded).unwrap(),
+                format!("{value:016x}")
+            );
+        }
+
+        let mut value = 0x4d59_5df4_d0f3_3173_u64;
+        for _ in 0..10_000 {
+            value ^= value << 13;
+            value ^= value >> 7;
+            value ^= value << 17;
+            let encoded = encode_prefix_hash(value);
+            assert_eq!(
+                std::str::from_utf8(&encoded).unwrap(),
+                format!("{value:016x}")
+            );
+        }
     }
 
     #[test]
