@@ -231,18 +231,29 @@ impl LoadBalancingPolicy for BucketPolicy {
             .get(model_key)
             .map(|entry| entry.value().clone());
         let prefill_url = if let Some(bucket) = bucket {
-            let (choiced_url, chars_per_url_snapshot) = {
+            let (choiced_url, is_imbalanced, least_loaded_url) = {
                 let buc = bucket.read().unwrap();
-                let chars_per_url_snapshot = buc.chars_per_url.lock().unwrap().clone();
+                let (is_imbalanced, least_loaded_url) = {
+                    let chars_per_url = buc.chars_per_url.lock().unwrap();
+                    let max_load = chars_per_url.values().copied().max().unwrap_or(0);
+                    let min_load = chars_per_url.values().copied().min().unwrap_or(0);
+                    let abs_diff = max_load.saturating_sub(min_load);
+                    let rel_threshold = self.config.balance_rel_threshold * min_load as f32;
+                    let is_imbalanced = abs_diff > self.config.balance_abs_threshold
+                        && max_load as f32 > rel_threshold;
+                    let least_loaded_url = if is_imbalanced {
+                        chars_per_url
+                            .iter()
+                            .min_by_key(|(_, &chars)| chars)
+                            .map(|(url, _)| url.clone())
+                    } else {
+                        None
+                    };
+                    (is_imbalanced, least_loaded_url)
+                };
                 let choiced_url = buc.find_boundary(char_count);
-                (choiced_url, chars_per_url_snapshot)
+                (choiced_url, is_imbalanced, least_loaded_url)
             };
-            let max_load = chars_per_url_snapshot.values().copied().max().unwrap_or(0);
-            let min_load = chars_per_url_snapshot.values().copied().min().unwrap_or(0);
-            let abs_diff = max_load.saturating_sub(min_load);
-            let rel_threshold = self.config.balance_rel_threshold * min_load as f32;
-            let is_imbalanced =
-                abs_diff > self.config.balance_abs_threshold && max_load as f32 > rel_threshold;
             debug!(
                 "Current PD instance status | is_imbalanced={}",
                 is_imbalanced
@@ -251,17 +262,12 @@ impl LoadBalancingPolicy for BucketPolicy {
             let mut rng = rand::rng();
             let prefill_url = if is_imbalanced {
                 debug!("select prefill instance by Load Balance policy");
-                let min_url = chars_per_url_snapshot
-                    .iter()
-                    .min_by_key(|(_, &chars)| chars)
-                    .map(|(url, _)| url.clone())
-                    .unwrap_or_else(|| {
-                        let idx = rng.random_range(0..healthy_indices.len());
-                        let url = workers[healthy_indices[idx]].url();
-                        warn!("No URL found, randomly selecting: {}", url);
-                        url.to_string()
-                    });
-                min_url
+                least_loaded_url.unwrap_or_else(|| {
+                    let idx = rng.random_range(0..healthy_indices.len());
+                    let url = workers[healthy_indices[idx]].url();
+                    warn!("No URL found, randomly selecting: {}", url);
+                    url.to_string()
+                })
             } else {
                 debug!("select prefill instance by Bucket policy");
                 match choiced_url {
