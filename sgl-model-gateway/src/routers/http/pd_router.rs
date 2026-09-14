@@ -65,6 +65,27 @@ struct PreparedWorkerRequest<'a> {
     body: Cow<'a, Value>,
 }
 
+enum PDRequestPayload {
+    Json(Value),
+    SharedBytes(bytes::Bytes),
+}
+
+#[derive(Serialize)]
+#[serde(untagged)]
+enum ScalarOrBatch<T> {
+    Scalar(T),
+    Batch(Vec<T>),
+}
+
+#[derive(Serialize)]
+struct DirectPDRequest<'a, T: Serialize> {
+    #[serde(flatten)]
+    original: &'a T,
+    bootstrap_host: ScalarOrBatch<String>,
+    bootstrap_port: ScalarOrBatch<Option<u16>>,
+    bootstrap_room: ScalarOrBatch<u64>,
+}
+
 #[derive(Clone)]
 struct PDRequestContext<'a> {
     route: &'static str,
@@ -299,6 +320,52 @@ impl PDRouter {
         Ok(original)
     }
 
+    fn can_use_direct_shared_body(
+        route: &str,
+        prefill_worker: &dyn Worker,
+        decode_worker: &dyn Worker,
+    ) -> bool {
+        route != "/v1/responses"
+            && !prefill_worker.is_dp_aware()
+            && !decode_worker.is_dp_aware()
+            && prefill_worker.dp_rank().is_none()
+    }
+
+    fn serialize_direct_pd_request<T: Serialize>(
+        original: &T,
+        prefill_worker: &dyn Worker,
+        batch_size: Option<usize>,
+    ) -> Result<bytes::Bytes, serde_json::Error> {
+        let (bootstrap_host, bootstrap_port, bootstrap_room) = match batch_size {
+            Some(n) => (
+                ScalarOrBatch::Batch(
+                    (0..n)
+                        .map(|_| prefill_worker.bootstrap_host().to_string())
+                        .collect(),
+                ),
+                ScalarOrBatch::Batch((0..n).map(|_| prefill_worker.bootstrap_port()).collect()),
+                ScalarOrBatch::Batch(
+                    (0..n)
+                        .map(|_| super::pd_types::generate_room_id())
+                        .collect(),
+                ),
+            ),
+            None => (
+                ScalarOrBatch::Scalar(prefill_worker.bootstrap_host().to_string()),
+                ScalarOrBatch::Scalar(prefill_worker.bootstrap_port()),
+                ScalarOrBatch::Scalar(super::pd_types::generate_room_id()),
+            ),
+        };
+
+        serde_json::to_vec(&DirectPDRequest {
+            original,
+            bootstrap_host,
+            bootstrap_port,
+            bootstrap_room,
+        })
+        .map(bytes::Bytes::from)
+    }
+
     fn inject_prefill_dp_rank_for_decode<'a>(
         decode_request: Cow<'a, Value>,
         prefill_worker: &dyn Worker,
@@ -419,29 +486,46 @@ impl PDRouter {
                             decode.url()
                         );
 
-                        let mut json_request = match serde_json::to_value(shared_request.as_ref()) {
-                            Ok(v) => v,
-                            Err(e) => return Self::handle_serialization_error(e),
-                        };
-                        // ResponsesRequest serializes an absent stream as null, which SRT rejects.
-                        if context.route == "/v1/responses" {
-                            json_request["stream"] = Value::Bool(context.is_stream);
-                        }
-
-                        json_request = match Self::inject_bootstrap_into_value(
-                            json_request,
+                        let request_payload = if Self::can_use_direct_shared_body(
+                            context.route,
                             prefill.as_ref(),
-                            context.batch_size,
+                            decode.as_ref(),
                         ) {
-                            Ok(v) => v,
-                            Err(e) => return Self::handle_serialization_error(e),
+                            match Self::serialize_direct_pd_request(
+                                shared_request.as_ref(),
+                                prefill.as_ref(),
+                                context.batch_size,
+                            ) {
+                                Ok(body) => PDRequestPayload::SharedBytes(body),
+                                Err(e) => return Self::handle_serialization_error(e),
+                            }
+                        } else {
+                            let mut json_request =
+                                match serde_json::to_value(shared_request.as_ref()) {
+                                    Ok(v) => v,
+                                    Err(e) => return Self::handle_serialization_error(e),
+                                };
+                            // ResponsesRequest serializes an absent stream as null, which SRT rejects.
+                            if context.route == "/v1/responses" {
+                                json_request["stream"] = Value::Bool(context.is_stream);
+                            }
+
+                            json_request = match Self::inject_bootstrap_into_value(
+                                json_request,
+                                prefill.as_ref(),
+                                context.batch_size,
+                            ) {
+                                Ok(v) => v,
+                                Err(e) => return Self::handle_serialization_error(e),
+                            };
+                            PDRequestPayload::Json(json_request)
                         };
 
                         let ctx_is_stream = context.is_stream;
                         let response = self
                             .execute_dual_dispatch_internal(
                                 headers,
-                                json_request,
+                                request_payload,
                                 context,
                                 Arc::clone(&prefill),
                                 Arc::clone(&decode),
@@ -652,7 +736,7 @@ impl PDRouter {
     async fn execute_dual_dispatch_internal(
         &self,
         headers: Option<&HeaderMap>,
-        json_request: Value,
+        request_payload: PDRequestPayload,
         context: PDRequestContext<'_>,
         prefill: Arc<dyn Worker>,
         decode: Arc<dyn Worker>,
@@ -669,36 +753,59 @@ impl PDRouter {
         inject_trace_context_http(&mut headers_with_trace);
         let headers = Some(&headers_with_trace);
 
-        let (prepared_prefill, prepared_decode) = match Self::prepare_pd_worker_requests(
-            context.route,
-            &json_request,
-            prefill.as_ref(),
-            decode.as_ref(),
-        )
-        .await
-        {
-            Ok(requests) => requests,
-            Err(e) => {
-                error!("Failed to prepare PD worker requests: {}", e);
-                return error::internal_error("pd_request_preparation_failed", e);
-            }
-        };
+        // Build both requests. The common non-DP path reuses one serialized body;
+        // worker-specific DP transformations retain the existing Value pipeline.
+        let (prefill_request, decode_request) = match request_payload {
+            PDRequestPayload::Json(json_request) => {
+                let (prepared_prefill, prepared_decode) = match Self::prepare_pd_worker_requests(
+                    context.route,
+                    &json_request,
+                    prefill.as_ref(),
+                    decode.as_ref(),
+                )
+                .await
+                {
+                    Ok(requests) => requests,
+                    Err(e) => {
+                        error!("Failed to prepare PD worker requests: {}", e);
+                        return error::internal_error("pd_request_preparation_failed", e);
+                    }
+                };
 
-        // Build both requests
-        let prefill_request = self.build_post_with_headers(
-            &self.client,
-            &prepared_prefill.endpoint_url,
-            &prepared_prefill.body,
-            headers,
-            false,
-        );
-        let decode_request = self.build_post_with_headers(
-            &self.client,
-            &prepared_decode.endpoint_url,
-            &prepared_decode.body,
-            headers,
-            false,
-        );
+                (
+                    self.build_post_with_headers(
+                        &self.client,
+                        &prepared_prefill.endpoint_url,
+                        &prepared_prefill.body,
+                        headers,
+                        false,
+                    ),
+                    self.build_post_with_headers(
+                        &self.client,
+                        &prepared_decode.endpoint_url,
+                        &prepared_decode.body,
+                        headers,
+                        false,
+                    ),
+                )
+            }
+            PDRequestPayload::SharedBytes(body) => (
+                self.build_post_bytes_with_headers(
+                    &self.client,
+                    &Self::worker_endpoint_url(prefill.as_ref(), context.route),
+                    body.clone(),
+                    headers,
+                    false,
+                ),
+                self.build_post_bytes_with_headers(
+                    &self.client,
+                    &Self::worker_endpoint_url(decode.as_ref(), context.route),
+                    body,
+                    headers,
+                    false,
+                ),
+            ),
+        };
 
         // Run both in this handler task (not a detached tokio::spawn) so a client
         // disconnect cancels the pending decode request too, keeping the
@@ -1385,6 +1492,33 @@ impl PDRouter {
         request
     }
 
+    fn build_post_bytes_with_headers(
+        &self,
+        client: &Client,
+        endpoint_url: &str,
+        body: bytes::Bytes,
+        headers: Option<&HeaderMap>,
+        connection_close: bool,
+    ) -> reqwest::RequestBuilder {
+        let mut request = client
+            .post(endpoint_url)
+            .header(CONTENT_TYPE, "application/json")
+            .body(body);
+        if connection_close {
+            request = request.header("Connection", "close");
+        }
+        if let Some(headers) = headers {
+            for (name, value) in headers.iter() {
+                if header_utils::should_forward_request_header(name.as_str()) {
+                    if let Ok(val) = value.to_str() {
+                        request = request.header(name, val);
+                    }
+                }
+            }
+        }
+        request
+    }
+
     // Helper to merge logprobs from prefill and decode responses
     // Optimized to avoid double cloning by taking ownership of decode array
     fn merge_logprobs_in_json(prefill_json: &Value, decode_json: &mut Value) -> bool {
@@ -1977,6 +2111,131 @@ mod tests {
         assert!(decode_request.body.get("disagg_prefill_dp_rank").is_none());
         assert!(matches!(prefill_request.body, Cow::Borrowed(_)));
         assert!(matches!(decode_request.body, Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn test_direct_pd_request_preserves_scalar_json_shape() {
+        #[derive(Serialize)]
+        struct TestRequest<'a> {
+            prompt: &'a str,
+            max_tokens: usize,
+        }
+
+        let prefill = BasicWorkerBuilder::new("http://prefill:30000")
+            .worker_type(WorkerType::Prefill {
+                bootstrap_port: Some(8998),
+            })
+            .build();
+        let request = TestRequest {
+            prompt: "shared prefix",
+            max_tokens: 8,
+        };
+
+        let body = PDRouter::serialize_direct_pd_request(&request, &prefill, None).unwrap();
+        let actual: Value = serde_json::from_slice(&body).unwrap();
+        let mut expected = serde_json::to_value(&request).unwrap();
+        expected["bootstrap_host"] = actual["bootstrap_host"].clone();
+        expected["bootstrap_port"] = actual["bootstrap_port"].clone();
+        expected["bootstrap_room"] = actual["bootstrap_room"].clone();
+
+        assert_eq!(actual, expected);
+        assert_eq!(actual["bootstrap_host"], "prefill");
+        assert_eq!(actual["bootstrap_port"], 8998);
+        assert!(actual["bootstrap_room"].as_u64().unwrap() <= i64::MAX as u64);
+    }
+
+    #[test]
+    fn test_direct_pd_request_preserves_batch_json_shape() {
+        #[derive(Serialize)]
+        struct TestRequest<'a> {
+            input_ids: &'a [Vec<u32>],
+        }
+
+        let prefill = BasicWorkerBuilder::new("http://prefill:30000")
+            .worker_type(WorkerType::Prefill {
+                bootstrap_port: None,
+            })
+            .build();
+        let input_ids = vec![vec![1, 2], vec![3, 4], vec![5, 6]];
+        let request = TestRequest {
+            input_ids: &input_ids,
+        };
+
+        let body = PDRouter::serialize_direct_pd_request(&request, &prefill, Some(3)).unwrap();
+        let actual: Value = serde_json::from_slice(&body).unwrap();
+        let mut expected = serde_json::to_value(&request).unwrap();
+        expected["bootstrap_host"] = actual["bootstrap_host"].clone();
+        expected["bootstrap_port"] = actual["bootstrap_port"].clone();
+        expected["bootstrap_room"] = actual["bootstrap_room"].clone();
+
+        assert_eq!(actual, expected);
+        assert_eq!(
+            actual["bootstrap_host"],
+            json!(["prefill", "prefill", "prefill"])
+        );
+        assert_eq!(actual["bootstrap_port"], json!([null, null, null]));
+        assert_eq!(actual["bootstrap_room"].as_array().unwrap().len(), 3);
+        assert!(actual["bootstrap_room"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|room| room.as_u64().unwrap() <= i64::MAX as u64));
+    }
+
+    #[test]
+    fn test_direct_shared_body_eligibility_preserves_fallbacks() {
+        let basic_prefill = BasicWorkerBuilder::new("http://prefill:30000")
+            .worker_type(WorkerType::Prefill {
+                bootstrap_port: Some(8998),
+            })
+            .build();
+        let basic_decode = BasicWorkerBuilder::new("http://decode:30001")
+            .worker_type(WorkerType::Decode)
+            .build();
+        let dp_prefill = DPAwareWorkerBuilder::new("http://prefill:30000", 2, 4)
+            .worker_type(WorkerType::Prefill {
+                bootstrap_port: Some(8998),
+            })
+            .build();
+
+        assert!(PDRouter::can_use_direct_shared_body(
+            "/v1/completions",
+            &basic_prefill,
+            &basic_decode,
+        ));
+        assert!(!PDRouter::can_use_direct_shared_body(
+            "/v1/responses",
+            &basic_prefill,
+            &basic_decode,
+        ));
+        assert!(!PDRouter::can_use_direct_shared_body(
+            "/v1/completions",
+            &dp_prefill,
+            &basic_decode,
+        ));
+    }
+
+    #[test]
+    fn test_direct_body_builder_sets_json_and_reuses_exact_bytes() {
+        let router = create_test_pd_router();
+        let body = bytes::Bytes::from_static(br#"{"prompt":"shared prefix"}"#);
+        let mut headers = HeaderMap::new();
+        headers.insert("x-request-id", HeaderValue::from_static("req-1"));
+
+        let request = router
+            .build_post_bytes_with_headers(
+                &router.client,
+                "http://worker/v1/completions",
+                body.clone(),
+                Some(&headers),
+                false,
+            )
+            .build()
+            .unwrap();
+
+        assert_eq!(request.headers()[CONTENT_TYPE], "application/json");
+        assert_eq!(request.headers()["x-request-id"], "req-1");
+        assert_eq!(request.body().unwrap().as_bytes().unwrap(), body.as_ref());
     }
 
     #[test]
