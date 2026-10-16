@@ -214,10 +214,8 @@ class Content:
                 )
 
 
-# OPENAI_CLIP stats, matching Qwen2VLImageProcessor (preprocessor_config.json
-# image_mean/image_std with do_rescale 1/255). Kept in 0-255 space because
-# standardize_batch sees un-rescaled PIL tensors. ImageNet values were wrong
-# for MiMo-VL and scrambled colors.
+# Legacy CLIP fallback when the checkpoint does not provide image statistics.
+# Kept in 0-255 space because standardize_batch sees un-rescaled PIL tensors.
 _QWEN2VL_PIXEL_MEAN = (
     torch.Tensor([0.48145466, 0.4578275, 0.40821073]).view(-1, 1, 1) * 255.0
 )
@@ -285,11 +283,15 @@ class MiMoProcessor:
         video_process_num_threads=16,
         video_decode_num_threads=0,
         device=None,
+        image_mean=None,
+        image_std=None,
         **kwargs,
     ):
         self.tokenizer = tokenizer
         self.video_process_num_threads = video_process_num_threads
         self.video_decode_num_threads = video_decode_num_threads
+        self.image_mean = image_mean
+        self.image_std = image_std
 
         if device is None:
             self.device = None
@@ -521,7 +523,7 @@ class MiMoProcessor:
                 vdw.close()
         return video_blob, video_tuple
 
-    def preprocess_for_encoder(self, mm_data, modality):
+    def preprocess_for_encoder(self, mm_data, modality, *, image_mean=None, image_std=None):
         # EPD encoder-side features. video_audio_* fields appear when any
         # video has audio; the D side uses them to rebuild input_ids.
         from sglang.srt.managers.schedule_batch import Modality
@@ -541,6 +543,8 @@ class MiMoProcessor:
                     min_pixels=min_pixels,
                     max_pixels=max_pixels,
                     device=self.device,
+                    image_mean=self.image_mean if image_mean is None else image_mean,
+                    image_std=self.image_std if image_std is None else image_std,
                 )
                 patches, grid = self._flatten_visual_inputs(img_tensor, "image")
                 all_patches.append(patches)
@@ -558,7 +562,9 @@ class MiMoProcessor:
             for video_data in mm_data:
                 video_blob, video_tuple = self._load_video_for_encoder(video_data)
                 patches, grid, aligned_ts, video_meta = self.process_video(
-                    VideoInput(video=video_tuple)
+                    VideoInput(video=video_tuple),
+                    image_mean=image_mean,
+                    image_std=image_std,
                 )
                 all_patches.append(patches)
                 all_grids.append(grid)
@@ -662,11 +668,18 @@ class MiMoProcessor:
             min_pixels=kwargs["min_pixels"],
             max_pixels=kwargs["max_pixels"],
             device=self.device,
+            image_mean=self.image_mean,
+            image_std=self.image_std,
         )
         return image_transformed_tensor
 
     def process_video(
-        self, video_input: VideoInput | VideoAudioInput, temporal_padding_factor=None
+        self,
+        video_input: VideoInput | VideoAudioInput,
+        temporal_padding_factor=None,
+        *,
+        image_mean=None,
+        image_std=None,
     ):
         def smart_resize_video(
             num_total_frames, min_pixels, max_pixels, total_max_pixels, **kwargs
@@ -804,6 +817,8 @@ class MiMoProcessor:
             min_pixels=min_pixels,
             max_pixels=max_pixels,
             device=self.device,
+            image_mean=self.image_mean if image_mean is None else image_mean,
+            image_std=self.image_std if image_std is None else image_std,
         )
 
         visual_patches, thw_grid = self._flatten_visual_inputs(
@@ -1345,17 +1360,43 @@ class MiMoProcessor:
             return pil_image.convert("RGB")
 
     @staticmethod
-    def standardize_batch(images: torch.Tensor) -> torch.Tensor:
+    def standardize_batch(
+        images: torch.Tensor, image_mean=None, image_std=None
+    ) -> torch.Tensor:
         device_key = str(images.device)
-        if device_key not in _mean_std_cache:
-            _mean_std_cache[device_key] = (
-                _QWEN2VL_PIXEL_MEAN.detach()
-                .clone()
-                .to(images.device)
-                .view(1, -1, 1, 1),
-                _QWEN2VL_PIXEL_STD.detach().clone().to(images.device).view(1, -1, 1, 1),
+        mean_key = (
+            None
+            if image_mean is None
+            else (
+                (image_mean,)
+                if isinstance(image_mean, (int, float))
+                else tuple(image_mean)
             )
-        mean, std = _mean_std_cache[device_key]
+        )
+        std_key = (
+            None
+            if image_std is None
+            else (
+                (image_std,) if isinstance(image_std, (int, float)) else tuple(image_std)
+            )
+        )
+        key = (device_key, mean_key, std_key)
+        if key not in _mean_std_cache:
+            mean = (
+                _QWEN2VL_PIXEL_MEAN
+                if mean_key is None
+                else torch.tensor(mean_key, dtype=torch.float32) * 255.0
+            )
+            std = (
+                _QWEN2VL_PIXEL_STD
+                if std_key is None
+                else torch.tensor(std_key, dtype=torch.float32) * 255.0
+            )
+            _mean_std_cache[key] = (
+                mean.detach().clone().to(images.device).view(1, -1, 1, 1),
+                std.detach().clone().to(images.device).view(1, -1, 1, 1),
+            )
+        mean, std = _mean_std_cache[key]
         return (images - mean) / std
 
     @classmethod
@@ -1366,6 +1407,8 @@ class MiMoProcessor:
         min_pixels: int,
         max_pixels: int,
         device: Optional[torch.device] = None,
+        image_mean=None,
+        image_std=None,
     ):
         if device is not None:
             frames = frames.to(device)
@@ -1379,7 +1422,7 @@ class MiMoProcessor:
             mode="bilinear",
             align_corners=False,
         )
-        standardized = cls.standardize_batch(resized)
+        standardized = cls.standardize_batch(resized, image_mean, image_std)
 
         return standardized, w_bar, h_bar
 
@@ -1391,6 +1434,8 @@ class MiMoProcessor:
         min_pixels: int,
         max_pixels: int,
         device: Optional[torch.device] = None,
+        image_mean=None,
+        image_std=None,
     ):
         if isinstance(img, torch.Tensor):
             img_tensor = img.float()
@@ -1416,7 +1461,9 @@ class MiMoProcessor:
             mode="bilinear",
             align_corners=False,
         )
-        img_standardized = cls.standardize_batch(img_resized).squeeze(0)
+        img_standardized = cls.standardize_batch(
+            img_resized, image_mean, image_std
+        ).squeeze(0)
 
         return img_standardized, w_bar, h_bar
 
@@ -1567,6 +1614,7 @@ class MiMoV2Processor(BaseMultimodalProcessor):
         )
         self.use_image_processor_gpu = envs.SGLANG_ENCODER_IMAGE_PROCESSOR_USE_GPU.get()
         device = get_device().device if self.use_image_processor_gpu else None
+        image_processor = getattr(self._processor, "image_processor", None)
 
         self.mimo_processor = MiMoProcessor(
             tokenizer=self._processor.tokenizer,
@@ -1605,6 +1653,8 @@ class MiMoV2Processor(BaseMultimodalProcessor):
             rope_type=rope_type,
             use_video_timestamps=processor_config.get("use_video_timestamps", False),
             device=device,
+            image_mean=getattr(image_processor, "image_mean", None),
+            image_std=getattr(image_processor, "image_std", None),
         )
         self._processor = self.mimo_processor
 

@@ -1342,14 +1342,21 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
         pattern = MultiModalityDataPaddingPatternMultimodalTokens()
         return pattern.pad_input_tokens(input_ids, mm_inputs)
 
-    def preprocess_mm_for_encoder(self, mm_data, modality, config):
+    def preprocess_mm_for_encoder(
+        self, mm_data, modality, config, *, image_processor=None
+    ):
         if self._encoder_processor is None:
             from sglang.srt.multimodal.processors.mimo_v2 import MiMoProcessor
 
             self._encoder_processor = MiMoProcessor.from_hf_config(
                 self.config, mm_config=config
             )
-        return self._encoder_processor.preprocess_for_encoder(mm_data, modality)
+        return self._encoder_processor.preprocess_for_encoder(
+            mm_data,
+            modality,
+            image_mean=getattr(image_processor, "image_mean", None),
+            image_std=getattr(image_processor, "image_std", None),
+        )
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         pixel_values = torch.cat([item.feature for item in items], dim=0).type(
