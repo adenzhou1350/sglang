@@ -16,10 +16,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: afc7b29a170de0c7dc583c3f452c3454382be812
+          ref: 741316aa19b81374818b9e116b8fa510f89c69f1
           persist-credentials: false
       - name: Verify candidate
-        run: test "$(git rev-parse HEAD)" = afc7b29a170de0c7dc583c3f452c3454382be812
+        run: test "$(git rev-parse HEAD)" = 741316aa19b81374818b9e116b8fa510f89c69f1
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
