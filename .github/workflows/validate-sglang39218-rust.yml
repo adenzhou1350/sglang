@@ -1,0 +1,44 @@
+name: SGLang 39218 Rust validation
+on:
+  push:
+    branches: [codex/sglang39218-rust-validation-20261109]
+permissions:
+  contents: read
+jobs:
+  cargo:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    env:
+      CARGO_BUILD_JOBS: '3'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: afc7b29a170de0c7dc583c3f452c3454382be812
+          persist-credentials: false
+      - name: Verify candidate
+        run: test "$(git rev-parse HEAD)" = afc7b29a170de0c7dc583c3f452c3454382be812
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install upstream Rust and protoc dependencies
+        run: bash scripts/ci/utils/install_rust_protoc.sh
+      - name: Format
+        working-directory: rust
+        run: cargo fmt --all -- --check
+      - name: Focused chat media tests
+        working-directory: rust
+        run: |
+          cargo test --locked -p sglang-server --lib chat_images
+          cargo test --locked -p sglang-server --lib file_content_remains_rejected_by_request_schema
+      - name: Cache the upstream DeepSeek test fixtures
+        working-directory: rust
+        run: sglang-processor/tests/scripts/cache_deepseek_files.sh
+      - name: Run sglang-server unit suite
+        working-directory: rust
+        run: cargo test --locked -p sglang-server --lib
+      - name: Clippy
+        working-directory: rust
+        run: cargo clippy --locked -p sglang-server --lib --tests -- -D warnings
